@@ -1,0 +1,18 @@
+[package]
+name = "market_square"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "Atomic message queue, based on the market square."
+repository = "https://github.com/Bill13579/market_square"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+parking_lot = { version = "0.12", features = ["send_guard"] }
+pollster = "0.4"
+tokio = { version = "1.44", features = ["sync"], default-features = false }
+
+[features]
+default = [
+    "autodrop"
+]
+autodrop = []
