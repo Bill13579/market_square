@@ -44,7 +44,7 @@ fn main() {
                     match writer.reserve(1) {
                         Ok(mut reservation) => {
                             reservation.get_mut(0).unwrap().write(format!("hello from writer {} ({})", i, msg_idx));
-                            reservation.publish_spin();
+                            unsafe { reservation.publish_spin() };
                             break;
                         }
                         Err(_) => {

@@ -31,7 +31,7 @@ fn main() {
                     match area.reserve(1) {
                         Ok(mut reservation) => {
                             reservation.get_mut(0).unwrap().write(format!("hello from thread {} ({})", i, msg_idx));
-                            reservation.publish_spin();
+                            unsafe { reservation.publish_spin() };
                             msg_idx += 1;
                         }
                         Err(_) => {

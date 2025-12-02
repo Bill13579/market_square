@@ -921,7 +921,11 @@ where
 
     /// Publish the reserved slots.
     /// Consumes the reservation.
-    pub fn publish(mut self) -> Result<(), Self> {
+    /// 
+    /// # Safety
+    /// This function is marked unsafe since it is the point at which the messages go out, and readers can access it with the assumption that all slots are initialized.
+    /// If you have not initialized all slots in the reservation before calling this, readers will see uninitialized data and cause undefined behavior.
+    pub unsafe fn publish(mut self) -> Result<(), Self> {
         self.published = true;
         match self.writer.publish_slots(self.start_gen, self.end_gen) {
             Ok(_) => Ok(()),
@@ -931,9 +935,13 @@ where
 
     /// Publish the reserved slots, spinning if necessary.
     /// Consumes the reservation.
-    pub fn publish_spin(self) {
+    /// 
+    /// # Safety
+    /// This function is marked unsafe since it is the point at which the messages go out, and readers can access it with the assumption that all slots are initialized.
+    /// If you have not initialized all slots in the reservation before calling this, readers will see uninitialized data and cause undefined behavior.
+    pub unsafe fn publish_spin(self) {
         let mut reservation = self;
-        while let Err(returned) = reservation.publish() {
+        while let Err(returned) = unsafe { reservation.publish() } {
             reservation = returned;
             std::hint::spin_loop();
         }
@@ -1483,7 +1491,7 @@ mod tests {
             reservation.get_mut(i).unwrap().write(100 + i as u64);
         }
         
-        reservation.publish().unwrap();
+        unsafe { reservation.publish() }.unwrap();
     }
 
     #[test]
@@ -1510,11 +1518,11 @@ mod tests {
         right.get_mut(1).unwrap().write(103);
 
         // Verify correct ordering works.
-        match right.publish() {
+        match unsafe { right.publish() } {
             Ok(_) => panic!("Wrong order works; there's a bug"),
             Err(right) => {
-                assert!(left.publish().is_ok());
-                assert!(right.publish().is_ok());
+                assert!(unsafe { left.publish() }.is_ok());
+                assert!(unsafe { right.publish() }.is_ok());
             },
         }
     }
@@ -1536,7 +1544,7 @@ mod tests {
         }
 
         // Publish
-        reservation.publish_spin();
+        unsafe { reservation.publish_spin() };
 
         // Verify
         let slice = reader.load_read_gen();
@@ -1575,7 +1583,7 @@ mod tests {
             (&raw mut (*ptr).b).write(vec![1, 2, 3]);
         }
 
-        reservation.publish().unwrap();
+        unsafe { reservation.publish() }.unwrap();
 
         // Verify read
         let slice = reader.read_with_check().expect("There should be writers!");

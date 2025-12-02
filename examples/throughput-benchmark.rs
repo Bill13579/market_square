@@ -75,7 +75,7 @@ fn benchmark_market_square() {
                             for i in 0..BATCH_SIZE {
                                 reservation.get_mut(i).unwrap().write((msg_idx * BATCH_SIZE + i) as u64); // Use msg_idx * BATCH_SIZE + i for unique values
                             }
-                            reservation.publish_spin();
+                            unsafe { reservation.publish_spin() };
                             break;
                         }
                         Err(_) => {
