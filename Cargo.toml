@@ -1,0 +1,19 @@
+[package]
+name = "market_square"
+version = "0.1.0"
+edition = "2024"
+description = "A lock-free mpmc \"square\""
+homepage = "https://github.com/Bill13579/market_square"
+repository = "https://github.com/Bill13579/market_square"
+documentation = "https://docs.rs/market_square"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["channel", "mpmc", "broadcast", "lock-free"]
+categories = ["algorithms", "concurrency", "data-structures"]
+
+[dependencies]
+crossbeam-utils = "0.8"
+rand = "0.9"
+
+[dev-dependencies]
+crossbeam-channel = "0.5"
