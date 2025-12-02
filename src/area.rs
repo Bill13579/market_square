@@ -1,5 +1,6 @@
 use std::{
     cell::UnsafeCell,
+    marker::PhantomData,
     mem::MaybeUninit,
     ptr::{self, NonNull},
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -708,40 +709,29 @@ impl<T> AreaWriter<T> {
             AreaWriter { inner: self.inner }
         }
     }
+}
 
+pub trait AreaWriterTrait<T> {
     /// Try to reserve n slots for writing.
     /// Returns (start_generation, end_generation) on success.
     /// end_generation is exclusive (so the range is [start_generation, end_generation)).
-    #[inline]
-    fn try_reserve_slots(&self, n: usize) -> Result<(u64, u64), ReserveError> {
-        unsafe { self.inner.as_ref().try_reserve_slots(n) }
-    }
+    fn try_reserve_slots(&self, n: usize) -> Result<(u64, u64), ReserveError>;
 
     /// Try to reserve up to n slots, getting as many as possible.
     /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
     /// Never returns NoSpace - gets 0 slots if none available.
     /// end_generation is exclusive (so the range is [start_generation, end_generation)).
-    #[inline]
     fn try_reserve_slots_best_effort(
         &self,
         n: usize,
-    ) -> Result<(u64, u64, usize), ReserveError> {
-        unsafe { self.inner.as_ref().try_reserve_slots_best_effort(n) }
-    }
+    ) -> Result<(u64, u64, usize), ReserveError>;
 
     /// Publish slots in the range [start_generation, end_generation) for readers.
-    #[inline]
     fn publish_slots(
         &self,
         start_generation: u64,
         end_generation: u64,
-    ) -> Result<(), PublishError> {
-        unsafe {
-            self.inner
-                .as_ref()
-                .publish_slots(start_generation, end_generation)
-        }
-    }
+    ) -> Result<(), PublishError>;
 
     /// Get a mutable pointer to the slot at the given generation number.
     ///
@@ -749,11 +739,101 @@ impl<T> AreaWriter<T> {
     /// - generation must be within a range you reserved via try_reserve_slots
     /// - You must initialize the slot before calling publish_slots
     /// - You MUST NOT access the slot after publishing (use a separate AreaReader for that)
-    #[inline]
-    unsafe fn get_slot_ptr(&self, generation: u64) -> *mut T {
-        unsafe { self.inner.as_ref().get_slot_ptr_mut(generation) }
-    }
+    unsafe fn get_slot_ptr(&self, generation: u64) -> *mut T;
+}
 
+macro_rules! impl_writer_functionality {
+    ( $($name:ident),* ) => { // Matches one or more identifiers separated by commas
+        $( // Starts a repetition for each identifier captured by `$name`
+            impl<T> AreaWriterTrait<T> for $name<T> {
+                /// Try to reserve n slots for writing.
+                /// Returns (start_generation, end_generation) on success.
+                /// end_generation is exclusive (so the range is [start_generation, end_generation)).
+                #[inline]
+                fn try_reserve_slots(&self, n: usize) -> Result<(u64, u64), ReserveError> {
+                    unsafe { self.inner.as_ref().try_reserve_slots(n) }
+                }
+
+                /// Try to reserve up to n slots, getting as many as possible.
+                /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
+                /// Never returns NoSpace - gets 0 slots if none available.
+                /// end_generation is exclusive (so the range is [start_generation, end_generation)).
+                #[inline]
+                fn try_reserve_slots_best_effort(
+                    &self,
+                    n: usize,
+                ) -> Result<(u64, u64, usize), ReserveError> {
+                    unsafe { self.inner.as_ref().try_reserve_slots_best_effort(n) }
+                }
+
+                /// Publish slots in the range [start_generation, end_generation) for readers.
+                #[inline]
+                fn publish_slots(
+                    &self,
+                    start_generation: u64,
+                    end_generation: u64,
+                ) -> Result<(), PublishError> {
+                    unsafe {
+                        self.inner
+                            .as_ref()
+                            .publish_slots(start_generation, end_generation)
+                    }
+                }
+
+                /// Get a mutable pointer to the slot at the given generation number.
+                ///
+                /// # Safety
+                /// - generation must be within a range you reserved via try_reserve_slots
+                /// - You must initialize the slot before calling publish_slots
+                /// - You MUST NOT access the slot after publishing (use a separate AreaReader for that)
+                #[inline]
+                unsafe fn get_slot_ptr(&self, generation: u64) -> *mut T {
+                    unsafe { self.inner.as_ref().get_slot_ptr_mut(generation) }
+                }
+            }
+
+            impl<T> $name<T> {
+                /// Create a reservation for n slots.
+                /// Returns a RAII guard that must be published.
+                pub fn reserve(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
+                    let (start, end) = self.try_reserve_slots(n)?;
+                    Ok(Reservation {
+                        writer: self,
+                        start_gen: start,
+                        end_gen: end,
+                        published: false,
+                        phantom: PhantomData,
+                    })
+                }
+
+                /// Try to reserve up to n slots, getting as many as possible.
+                /// Returns a RAII guard that must be published.
+                pub fn reserve_best_effort(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
+                    let (start, end, count) = self.try_reserve_slots_best_effort(n)?;
+                    debug_assert!(end - start == count as u64);
+                    Ok(Reservation {
+                        writer: self,
+                        start_gen: start,
+                        end_gen: end,
+                        published: false,
+                        phantom: PhantomData,
+                    })
+                }
+            }
+
+            impl<T> $name<T> {
+                /// Get the number of active writers
+                pub fn get_writers_count(&self) -> usize {
+                    unsafe { self.inner.as_ref().load_writers_count() }
+                }
+            }
+        )* // Ends the repetition
+    };
+}
+
+impl_writer_functionality!(AreaWriter, AreaReader);
+
+impl<T> AreaWriter<T> {
     /// Try to cleanup old slots by advancing last_valid_gen
     #[inline]
     pub fn try_cleanup_old_slots(&self) -> Result<CleanupResult, CleanupError> {
@@ -797,14 +877,21 @@ impl<T> Drop for AreaWriter<T> {
 /// A RAII guard for reserved slots.
 /// Must be published or dropped (which panics if not published).
 #[derive(Debug)]
-pub struct Reservation<'a, T> {
-    writer: &'a AreaWriter<T>,
+pub struct Reservation<'a, W, T>
+where 
+    W: AreaWriterTrait<T>
+{
+    writer: &'a W,
     start_gen: u64,
     end_gen: u64,
     published: bool,
+    phantom: PhantomData<T>,
 }
 
-impl<'a, T> Reservation<'a, T> {
+impl<'a, W, T> Reservation<'a, W, T>
+where
+    W: AreaWriterTrait<T>
+{
     /// Get the number of reserved slots
     pub fn len(&self) -> usize {
         (self.end_gen - self.start_gen) as usize
@@ -858,7 +945,7 @@ impl<'a, T> Reservation<'a, T> {
     ///
     /// # Panics
     /// Panics if index > self.len()
-    pub fn split_at_mut(mut self, index: usize) -> (Reservation<'a, T>, Reservation<'a, T>) {
+    pub fn split_at_mut(mut self, index: usize) -> (Reservation<'a, W, T>, Reservation<'a, W, T>) {
         assert!(index <= self.len(), "index out of bounds");
 
         // Mark self as published so it doesn't panic on drop
@@ -871,6 +958,7 @@ impl<'a, T> Reservation<'a, T> {
             start_gen: self.start_gen,
             end_gen: split_gen,
             published: false,
+            phantom: PhantomData,
         };
 
         let right = Reservation {
@@ -878,13 +966,17 @@ impl<'a, T> Reservation<'a, T> {
             start_gen: split_gen,
             end_gen: self.end_gen,
             published: false,
+            phantom: PhantomData,
         };
 
         (left, right)
     }
 }
 
-impl<'a, T> Drop for Reservation<'a, T> {
+impl<'a, W, T> Drop for Reservation<'a, W, T>
+where
+    W: AreaWriterTrait<T>
+{
     fn drop(&mut self) {
         if !self.published && !std::thread::panicking() {
             // If we are not panicking, and we haven't published, this is a bug.
@@ -895,33 +987,6 @@ impl<'a, T> Drop for Reservation<'a, T> {
                 self.start_gen, self.end_gen
             );
         }
-    }
-}
-
-impl<T> AreaWriter<T> {
-    /// Create a reservation for n slots.
-    /// Returns a RAII guard that must be published.
-    pub fn reserve(&self, n: usize) -> Result<Reservation<'_, T>, ReserveError> {
-        let (start, end) = self.try_reserve_slots(n)?;
-        Ok(Reservation {
-            writer: self,
-            start_gen: start,
-            end_gen: end,
-            published: false,
-        })
-    }
-
-    /// Try to reserve up to n slots, getting as many as possible.
-    /// Returns a RAII guard that must be published.
-    pub fn reserve_best_effort(&self, n: usize) -> Result<Reservation<'_, T>, ReserveError> {
-        let (start, end, count) = self.try_reserve_slots_best_effort(n)?;
-        debug_assert!(end - start == count as u64);
-        Ok(Reservation {
-            writer: self,
-            start_gen: start,
-            end_gen: end,
-            published: false,
-        })
     }
 }
 
@@ -955,11 +1020,6 @@ impl<T> AreaReader<T> {
                 .get_reader_gen(self.reader_id)
                 .expect("Reader not found! This should not happen.")
         }
-    }
-
-    /// Get the number of active writers
-    pub fn get_writers_count(&self) -> usize {
-        unsafe { self.inner.as_ref().load_writers_count() }
     }
 
     /// Load the current published read generation
@@ -1249,6 +1309,10 @@ impl<T> AreaReader<T> {
     /// When the slice is dropped, the reader automatically advances past these messages.
     /// 
     /// If no writers are still in the area, returns a [`ReadError`].
+    /// 
+    /// # Behavior to note
+    /// 
+    /// This method only checks for **AreaWriters,** not other AreaReaders. If you are primarily using the readers-are-also-writers pattern, use [`AreaReader::read`] instead and implement your own check for exit conditions.
     pub fn read_with_check(&mut self) -> Result<ReadSlice<'_, T>, ReadError> {
         let (returned_self, start_gen, _, _) = {
             let result = self.read();

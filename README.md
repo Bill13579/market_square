@@ -21,6 +21,7 @@ The goal of this crate is high-performance broadcast, but not at the expense of 
 
 - Lock-free
 - Dynamic enter/exit of readers and writers
+- Readers-are-also-writers, and new readers are dirt cheap to create
 - Reader suspension so that readers who are momentarily away can avoid holding up the cleaning of old messages
 - Batched publishing for writers, and batched read for readers
 - In-place message writing through `MaybeUninit`; you can skip intermediate struct allocation
@@ -54,7 +55,7 @@ For clean-up, **`try_cleanup_old_slots()` must be used periodically *somewhere*!
 
 Suspend readers with `suspend()`, and they will no longer maintain a claim to old messages and prevent clean-up.
 
-**See the examples, and especially the [hello world](./examples/hello-world.rs) for a full overview.** There is also a more complex benchmarking script example there which uses batching.
+**See the [hello world](./examples/hello-world.rs) and [readers-are-also-writers](./examples/readers-are-also-writers.rs) examples for a full overview.** There is also a more complex benchmarking script example there which uses batching.
 
 ## Benchmarks
 
