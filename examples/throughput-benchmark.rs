@@ -2,7 +2,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 use market_square::area::area;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{TryRecvError, TrySendError, bounded};
 
 const N_WRITERS: usize = 5; //writers contend for a single atomic; more writers increase contention for that CAS operation
 const M_READERS: usize = 5; //market_square scales very well with readers
@@ -119,8 +119,12 @@ fn benchmark_crossbeam() {
         let rx = rx.clone();
         reader_handles.push(thread::spawn(move || {
             let mut count = 0;
-            while let Ok(_) = rx.recv() {
-                count += 1;
+            loop {
+                match rx.try_recv() {
+                    Err(TryRecvError::Empty) => thread::yield_now(),
+                    Err(TryRecvError::Disconnected) => break,
+                    Ok(_) => count += 1,
+                }
             }
             count
         }));
@@ -134,7 +138,17 @@ fn benchmark_crossbeam() {
         writer_handles.push(thread::spawn(move || {
             barrier.wait();
             for i in 0..MESSAGES_PER_WRITER {
-                tx.send(i as u64).unwrap();
+                loop {
+                    match tx.try_send(i as u64) {
+                        Ok(_) => break,
+                        Err(TrySendError::Full(_)) => {
+                            thread::yield_now();
+                        },
+                        Err(TrySendError::Disconnected(_)) => {
+                            panic!("Channel disconnected unexpectedly!");
+                        }
+                    }
+                }
             }
         }));
     }
