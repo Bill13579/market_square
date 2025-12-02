@@ -1,9 +1,0 @@
-[workspace]
-members = [
-    "market_square",
-]
-resolver = "3"
-
-[profile.release]
-opt-level = 3
-lto = "thin"
