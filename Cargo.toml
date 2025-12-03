@@ -12,13 +12,13 @@ keywords = ["channel", "mpmc", "broadcast", "lock-free", "no_std"]
 categories = ["algorithms", "concurrency", "data-structures"]
 
 [features]
-default = ["std"]        # std is enabled by default
-std = []                 # marker feature for std
-alloc = []               # marker feature for alloc; added for future use, but for now, alloc is always required when std is disabled
+default = ["std"]           # std is enabled by default
+std = ["dep:rand"]   # marker feature for std
+alloc = []                  # marker feature for alloc; added for future use, but for now, alloc is always required when std is disabled
 
 [dependencies]
-crossbeam-utils = "0.8"
-rand = "0.9"
+crossbeam-utils = { version = "0.8", default-features = false }
+rand = { version = "0.9", optional = true, default-features = false, features = ["thread_rng"] }
 
 [dev-dependencies]
 crossbeam-channel = "0.5"

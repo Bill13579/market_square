@@ -36,8 +36,13 @@ The goal of this crate is high-performance broadcast, but not at the expense of 
 Add the following to your `Cargo.toml` file:
 
 ```toml
+# with std
 [dependencies]
 market_square = "0.1"
+
+# with no_std
+[dependencies]
+market_square = { version = "0.1", default-features = false, features = ["alloc"] }
 ```
 
 Usage is simple; you can create a new Area like so:

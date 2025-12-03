@@ -14,6 +14,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crossbeam_utils::CachePadded;
+#[cfg(feature = "std")]
 use rand::Rng;
 
 use crate::map::{self, IMMEDIATE, SimpleLPHashMap, ZERO_OFFSET};
@@ -331,11 +332,18 @@ impl<T> AreaInner<T> {
 
     /// Register a new reader, returning a unique reader ID.
     /// Uses CAS to enter from suspended state, retries on CAS failure.
+    #[cfg(feature = "std")]
     fn register_reader(&self) -> Result<u64, RegisterError> {
         // Generate a random reader ID using thread RNG
         let mut rng = rand::rng();
-        let mut seed = rng.random::<u64>();
+        let seed = rng.random::<u64>();
 
+        self.register_reader_with_seed(seed)
+    }
+
+    /// Register a new reader, with the provided reader ID seed. Note that the provided reader ID will be used to generate a unique reader ID, which is what will actually be used.
+    /// Uses CAS to enter from suspended state, retries on CAS failure.
+    fn register_reader_with_seed(&self, mut seed: u64) -> Result<u64, RegisterError> {
         // Ensure seed doesn't have MSB set
         seed = seed & !(1 << 63);
         if seed == 0 {
@@ -1015,10 +1023,25 @@ unsafe impl<T: Send> Sync for AreaReader<T> {}
 
 impl<T> AreaReader<T> {
     /// Create a new reader handle for the same area
+    #[cfg(feature = "std")]
     pub fn create_reader(&self) -> Result<Self, RegisterError> {
         unsafe {
             let inner = self.inner.as_ref();
             let reader_id = inner.register_reader()?;
+            Ok(AreaReader {
+                inner: self.inner,
+                reader_id,
+            })
+        }
+    }
+
+    /// Create a new reader handle for the same area
+    /// 
+    /// Uses the provided seed ID for reader ID generation. The actual ID will be a unique one derived from the seed.
+    pub fn create_reader_with_seed(&self, seed: u64) -> Result<Self, RegisterError> {
+        unsafe {
+            let inner = self.inner.as_ref();
+            let reader_id = inner.register_reader_with_seed(seed)?;
             Ok(AreaReader {
                 inner: self.inner,
                 reader_id,
