@@ -39,8 +39,10 @@ fn benchmark_market_square() {
     let mut writer_handles = vec![];
 
     // Spawn readers
-    for _ in 0..M_READERS {
-        let mut reader = reader.create_reader().expect("Failed to create reader");
+    for i in 0..M_READERS {
+        // Use create_reader if you have std, as it will provide better performance through randomized seeding.
+        // If you use this though, **seed must not be 0, or have the MSB set.**
+        let mut reader = reader.create_reader_with_seed(100 + i as u64).unwrap();
         reader_handles.push(thread::spawn(move || {
             let mut count = 0;
             let total_expected = (N_WRITERS * MESSAGES_PER_WRITER) as u64;

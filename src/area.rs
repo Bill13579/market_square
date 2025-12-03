@@ -1037,6 +1037,8 @@ impl<T> AreaReader<T> {
 
     /// Create a new reader handle for the same area
     /// 
+    /// **Seed must not be 0, or have the MSB set.**
+    /// 
     /// Uses the provided seed ID for reader ID generation. The actual ID will be a unique one derived from the seed.
     pub fn create_reader_with_seed(&self, seed: u64) -> Result<Self, RegisterError> {
         unsafe {
@@ -1455,7 +1457,7 @@ pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (AreaWriter<T>
         inner_ref.writers_count.store(1, Ordering::Release);
 
         // Register the initial reader
-        let reader_id = match inner_ref.register_reader() {
+        let reader_id = match inner_ref.register_reader_with_seed(0) {
             Ok(id) => id,
             Err(RegisterError::ReaderCapacityReached) => {
                 panic!("Initial reader registration failed: capacity reached")
@@ -1472,6 +1474,14 @@ pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (AreaWriter<T>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    extern crate alloc;
+    #[cfg(feature = "std")]
+    extern crate std as alloc;
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    use alloc::vec::Vec;
 
     #[test]
     fn test_basic_writer_reserve_and_publish() {
@@ -1520,7 +1530,7 @@ mod tests {
             reservation.get_mut(i).unwrap().write(100 + i as u64);
         }
         
-        unsafe { reservation.publish() }.unwrap();
+        unsafe { reservation.publish() }.unwrap_or_else(|_| panic!("Failed to publish reservation"));
     }
 
     #[test]
@@ -1612,7 +1622,7 @@ mod tests {
             (&raw mut (*ptr).b).write(alloc::vec![1, 2, 3]);
         }
 
-        unsafe { reservation.publish() }.unwrap();
+        unsafe { reservation.publish() }.unwrap_or_else(|_| panic!("Failed to publish reservation"));
 
         // Verify read
         let slice = reader.read_with_check().expect("There should be writers!");
@@ -1674,11 +1684,11 @@ mod tests {
         // Capacity is 2. reader1 takes one slot.
 
         // Create another reader
-        let _reader2 = reader1.create_reader().expect("Should succeed");
+        let _reader2 = reader1.create_reader_with_seed(100).expect("Should succeed");
 
         // Now capacity should be full (2 readers)
         // Trying to create a 3rd reader should fail
-        let result = reader1.create_reader();
+        let result = reader1.create_reader_with_seed(101);
         assert_eq!(result.err(), Some(RegisterError::ReaderCapacityReached));
     }
 
@@ -1700,6 +1710,7 @@ mod tests {
         assert_eq!(end2, 4);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_create_reader() {
         let (writer, reader1) = AreaBuilder::new()
@@ -1990,7 +2001,7 @@ mod tests {
                 .reader_capacity(8)
                 .build::<u64>();
             let _writer2 = writer.create_writer();
-            let _reader2 = reader.create_reader().expect("Failed to create reader");
+            let _reader2 = reader.create_reader_with_seed(100).expect("Failed to create reader");
 
             // Use the handles a bit
             let (start, end) = writer.try_reserve_slots(2).expect("Failed to reserve");
@@ -2101,7 +2112,7 @@ mod tests {
         // Now register a new reader
         // It should pick up a slot that was dragged to 10
         // So it should start at 10
-        let reader2 = reader1.create_reader().expect("Failed to create reader");
+        let reader2 = reader1.create_reader_with_seed(100).expect("Failed to create reader");
         assert_eq!(reader2.get_gen(), 10);
     }
 

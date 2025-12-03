@@ -14,7 +14,9 @@ fn main() {
 
     // Reader threads
     for i in 0..10 {
-        let mut reader = reader.create_reader().unwrap();
+        // Use create_reader if you have std, as it will provide better performance through randomized seeding.
+        // If you use this though, **seed must not be 0, or have the MSB set.**
+        let mut reader = reader.create_reader_with_seed(100 + i).unwrap();
 
         reader_handles.push(thread::spawn(move || {
             while let Ok(slice) = reader.read_with_check() {
