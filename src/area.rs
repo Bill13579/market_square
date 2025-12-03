@@ -1457,7 +1457,7 @@ pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (AreaWriter<T>
         inner_ref.writers_count.store(1, Ordering::Release);
 
         // Register the initial reader
-        let reader_id = match inner_ref.register_reader_with_seed(0) {
+        let reader_id = match inner_ref.register_reader_with_seed(1) {
             Ok(id) => id,
             Err(RegisterError::ReaderCapacityReached) => {
                 panic!("Initial reader registration failed: capacity reached")
