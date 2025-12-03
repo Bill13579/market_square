@@ -1,3 +1,5 @@
+#![no_std]
+
 //! [<img src="https://kooworks.org/xathek" alt="Xathek" width="280">](https://kooworks.org/xathek)
 //! 
 //! # market_square
@@ -19,12 +21,15 @@
 //! 
 //! - Lock-free
 //! - Dynamic enter/exit of readers and writers
+//! - Readers-are-also-writers, and new readers are dirt cheap to create
 //! - Reader suspension so that readers who are momentarily away can avoid holding up the cleaning of old messages
 //! - Batched publishing for writers, and batched read for readers
+//! - In-place message writing through `MaybeUninit`; you can skip intermediate struct allocation
 //! - Any thread can clean-up old messages at any time, up to user in terms of where and when clean-up is done
 //! - CPU pre-fetching and cache-locality friendly structures
 //! - Ergonomic Rust-y RAII based API for ease-of-use
 //! - Maximum control and customization options with low-level control; bring-your-own-locks!
+//! - `no_std` support (requires `alloc`)
 //! 
 //! ## Usage
 //! 

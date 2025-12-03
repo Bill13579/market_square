@@ -1,10 +1,17 @@
-use std::{
+use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
     ptr::{self, NonNull},
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std as alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crossbeam_utils::CachePadded;
 use rand::Rng;
@@ -337,7 +344,7 @@ impl<T> AreaInner<T> {
 
         // Use folded insertion to get a unique reader ID
         unsafe {
-            let (ptr, is_new, _, reader_id_raw, index) = self.reader_gens.get_or_insert_concurrent(
+            let (ptr, is_new, _, reader_id_raw, index): (*const CachePadded<AtomicU64>, _, _, _, _) = self.reader_gens.get_or_insert_concurrent(
                 seed,
                 ZERO_OFFSET,
                 self.reader_gens.capacity(),
@@ -393,7 +400,7 @@ impl<T> AreaInner<T> {
         func_name: &str,
     ) -> Option<*const CachePadded<AtomicU64>> {
         unsafe {
-            let (ptr, is_new, _, _, _) = self.reader_gens.get_or_insert_concurrent(
+            let (ptr, is_new, _, _, _): (*const CachePadded<AtomicU64>, _, _, _, _) = self.reader_gens.get_or_insert_concurrent(
                 reader_id,
                 ZERO_OFFSET,
                 IMMEDIATE,
@@ -637,7 +644,7 @@ impl<T> AreaInner<T> {
                     let slots_cleaned = new_last_valid - last_valid;
 
                     // Drop items if T needs drop
-                    if std::mem::needs_drop::<T>() {
+                    if core::mem::needs_drop::<T>() {
                         for generation in last_valid..new_last_valid {
                             unsafe {
                                 let ptr = self.get_slot_ptr_mut(generation);
@@ -655,7 +662,7 @@ impl<T> AreaInner<T> {
                             Ordering::Acquire,
                         ) {
                             Ok(_) => break,
-                            Err(_) => std::hint::spin_loop(), // Loop again to try updating free_gen since another cleanup thread is still working
+                            Err(_) => core::hint::spin_loop(), // Loop again to try updating free_gen since another cleanup thread is still working
                         }
                     }
 
@@ -943,7 +950,7 @@ where
         let mut reservation = self;
         while let Err(returned) = unsafe { reservation.publish() } {
             reservation = returned;
-            std::hint::spin_loop();
+            core::hint::spin_loop();
         }
     }
 
@@ -986,8 +993,7 @@ where
     W: AreaWriterTrait<T>
 {
     fn drop(&mut self) {
-        if !self.published && !std::thread::panicking() {
-            // If we are not panicking, and we haven't published, this is a bug.
+        if !self.published {
             // We can't easily "unreserve" slots in this design without breaking the ring buffer continuity
             // or introducing holes, so we must panic to alert the developer.
             panic!(
@@ -1117,7 +1123,7 @@ impl<T> Drop for AreaReader<T> {
 
             // Step 9: We're attempting to free - wait for reader_keep_alloc_tickets to hit 0
             while keep_alloc.load(Ordering::Acquire) != 0 {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
             }
 
             // Now decrement reader_stage_tickets
@@ -1191,17 +1197,17 @@ impl<'a, T> ReadSlice<'a, T> {
     /// # Safety
     /// - The caller must ensure the reader is advanced appropriately
     pub unsafe fn into_raw_parts(self) -> (&'a mut AreaReader<T>, u64, u64, bool) {
-        let manually_dropped_s = std::mem::ManuallyDrop::new(self);
+        let manually_dropped_s = core::mem::ManuallyDrop::new(self);
 
         let reader;
         let start_gen;
         let end_gen;
         let armed;
         unsafe {
-            reader = std::ptr::read(&raw const manually_dropped_s.reader);
-            start_gen = std::ptr::read(&raw const manually_dropped_s.start_gen);
-            end_gen = std::ptr::read(&raw const manually_dropped_s.end_gen);
-            armed = std::ptr::read(&raw const manually_dropped_s.armed);
+            reader = core::ptr::read(&raw const manually_dropped_s.reader);
+            start_gen = core::ptr::read(&raw const manually_dropped_s.start_gen);
+            end_gen = core::ptr::read(&raw const manually_dropped_s.end_gen);
+            armed = core::ptr::read(&raw const manually_dropped_s.armed);
         }
 
         (reader, start_gen, end_gen, armed)
@@ -1254,14 +1260,14 @@ impl<'a, T> ReadSlice<'a, T> {
 
             if start_idx + len <= cap {
                 // Contiguous
-                let slice = std::slice::from_raw_parts(buffer_ptr.add(start_idx), len);
+                let slice = core::slice::from_raw_parts(buffer_ptr.add(start_idx), len);
                 (slice, &[])
             } else {
                 // Wraps around
                 let first_len = cap - start_idx;
                 let second_len = len - first_len;
-                let first = std::slice::from_raw_parts(buffer_ptr.add(start_idx), first_len);
-                let second = std::slice::from_raw_parts(buffer_ptr, second_len);
+                let first = core::slice::from_raw_parts(buffer_ptr.add(start_idx), first_len);
+                let second = core::slice::from_raw_parts(buffer_ptr, second_len);
                 (first, second)
             }
         }
@@ -1580,7 +1586,7 @@ mod tests {
         let ptr = slot.as_mut_ptr();
         unsafe {
             (&raw mut (*ptr).a).write(42);
-            (&raw mut (*ptr).b).write(vec![1, 2, 3]);
+            (&raw mut (*ptr).b).write(alloc::vec![1, 2, 3]);
         }
 
         unsafe { reservation.publish() }.unwrap();
@@ -1590,7 +1596,7 @@ mod tests {
         let (s1, _) = slice.as_slices();
         assert_eq!(s1.len(), 1);
         assert_eq!(s1[0].a, 42);
-        assert_eq!(s1[0].b, vec![1, 2, 3]);
+        assert_eq!(s1[0].b, alloc::vec![1, 2, 3]);
     }
 
     #[test]
@@ -2009,7 +2015,7 @@ mod tests {
 
             // Test iterator
             let values: Vec<u64> = slice.iter().copied().collect();
-            assert_eq!(values, vec![0, 100, 200, 300, 400]);
+            assert_eq!(values, alloc::vec![0, 100, 200, 300, 400]);
 
             // Test as_slices
             let (s1, s2) = slice.as_slices();

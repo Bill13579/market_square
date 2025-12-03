@@ -29,6 +29,7 @@ The goal of this crate is high-performance broadcast, but not at the expense of 
 - CPU pre-fetching and cache-locality friendly structures
 - Ergonomic Rust-y RAII based API for ease-of-use
 - Maximum control and customization options with low-level control; bring-your-own-locks!
+- `no_std` support (requires `alloc`)
 
 ## Usage
 

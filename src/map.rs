@@ -1,9 +1,16 @@
-use std::{
+use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr,
     sync::atomic::{AtomicU64, Ordering},
 };
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std as alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 pub const EMPTY: u64 = 0;
 pub const IN_PROGRESS: u64 = 1 << 63;

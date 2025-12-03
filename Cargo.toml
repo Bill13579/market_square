@@ -8,8 +8,13 @@ repository = "https://github.com/Bill13579/market_square"
 documentation = "https://docs.rs/market_square"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-keywords = ["channel", "mpmc", "broadcast", "lock-free"]
+keywords = ["channel", "mpmc", "broadcast", "lock-free", "no_std"]
 categories = ["algorithms", "concurrency", "data-structures"]
+
+[features]
+default = ["std"]        # std is enabled by default
+std = []                 # marker feature for std
+alloc = []               # marker feature for alloc; added for future use, but for now, alloc is always required when std is disabled
 
 [dependencies]
 crossbeam-utils = "0.8"
