@@ -1,6 +1,6 @@
 [package]
 name = "market_square"
-version = "0.2.0-alpha.1"
+version = "0.2.0"
 edition = "2024"
 description = "A lock-free mpmc \"square\""
 homepage = "https://github.com/Bill13579/market_square"

@@ -1,5 +1,3 @@
-**Feb 12, 2026:** The current `main` branch contains now an implementation generic over the underlying memory space used. **`no_alloc` is thus now supported!**
-
 [<img src="https://kooworks.org/xathek" alt="Xathek" width="280">](https://kooworks.org/xathek)
 
 # market_square
@@ -31,7 +29,7 @@ The goal of this crate is high-performance broadcast, but not at the expense of 
 - CPU pre-fetching and cache-locality friendly structures
 - Ergonomic Rust-y RAII based API for ease-of-use
 - Maximum control and customization options with low-level control; bring-your-own-locks!
-- `no_std` **and `no_alloc` (in main branch)** support
+- `no_std` **and `no_alloc`** support
 
 ## Usage
 
@@ -40,15 +38,15 @@ Add the following to your `Cargo.toml` file:
 ```toml
 # with std
 [dependencies]
-market_square = "0.1"
+market_square = "0.2"
 
 # with no_std
 [dependencies]
-market_square = { version = "0.1", default-features = false, features = ["alloc"] }
+market_square = { version = "0.2", default-features = false, features = ["alloc"] }
 
 # with no_alloc (see examples/no-alloc-static.rs for an example using static memory)
 [dependencies]
-market_square = { version = "0.1", default-features = false }
+market_square = { version = "0.2", default-features = false }
 ```
 
 Usage is simple; you can create a new Area like so:
