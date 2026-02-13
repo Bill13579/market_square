@@ -1,5 +1,5 @@
 use std::thread;
-use market_square::area::area;
+use market_square::{area::area, arithmetics::NumericType};
 
 // So that all writing starts together.
 use std::sync::{Arc, Barrier};
@@ -19,7 +19,7 @@ fn main() {
     for i in 0..20 {
         // Use create_reader if you have std, as it will provide better performance through randomized seeding.
         // If you use this though, **seed must not be 0, or have the MSB set.**
-        let mut area = area.create_reader_with_seed(100 + i as u64).unwrap();
+        let mut area = area.create_reader_with_seed(100 + i as NumericType).unwrap();
 
         let expected_msgs = 20 * 8;
 

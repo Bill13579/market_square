@@ -1,6 +1,6 @@
 [package]
 name = "market_square"
-version = "0.2.0"
+version = "0.2.1-alpha.1"
 edition = "2024"
 description = "A lock-free mpmc \"square\""
 homepage = "https://github.com/Bill13579/market_square"
@@ -15,6 +15,8 @@ categories = ["algorithms", "concurrency", "data-structures"]
 default = ["std"]           # std is enabled by default
 std = ["dep:rand"]          # marker feature for std
 alloc = []                  # marker feature for alloc
+small-gen = []              # marker feature for using 32-bit atomics
+no-cache-pad = []        # marker feature for not padding the cache line; reduces performance but saves memory
 
 [dependencies]
 rand = { version = "0.9", optional = true, default-features = false, features = ["thread_rng"] }

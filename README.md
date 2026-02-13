@@ -30,6 +30,8 @@ The goal of this crate is high-performance broadcast, but not at the expense of 
 - Ergonomic Rust-y RAII based API for ease-of-use
 - Maximum control and customization options with low-level control; bring-your-own-locks!
 - `no_std` **and `no_alloc`** support
+- `small-gen` feature to use `AtomicU32`s instead of `AtomicU64`s internally, and overflow handling
+- `no-cache-pad` feature to turn off cache-padding (`align(4)`)
 
 ## Usage
 

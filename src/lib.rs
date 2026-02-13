@@ -29,15 +29,26 @@
 //! - CPU pre-fetching and cache-locality friendly structures
 //! - Ergonomic Rust-y RAII based API for ease-of-use
 //! - Maximum control and customization options with low-level control; bring-your-own-locks!
-//! - `no_std` support (requires `alloc`)
+//! - `no_std` **and `no_alloc`** support
+//! - `small-gen` feature to use `AtomicU32`s instead of `AtomicU64`s internally, and overflow handling
+//! - `no-cache-pad` feature to turn off cache-padding (`align(4)`)
 //! 
 //! ## Usage
 //! 
 //! Add the following to your `Cargo.toml` file:
 //! 
 //! ```toml
+//! # with std
 //! [dependencies]
-//! market_square = "0.1"
+//! market_square = "0.2"
+//! 
+//! # with no_std
+//! [dependencies]
+//! market_square = { version = "0.2", default-features = false, features = ["alloc"] }
+//! 
+//! # with no_alloc (see examples/no-alloc-static.rs for an example using static memory)
+//! [dependencies]
+//! market_square = { version = "0.2", default-features = false }
 //! ```
 //! 
 //! Usage is simple; you can create a new Area like so:
@@ -284,3 +295,4 @@ pub mod map;
 pub mod area;
 pub mod storage;
 pub mod cache_padded;
+pub mod arithmetics;

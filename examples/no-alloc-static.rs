@@ -8,7 +8,8 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 
-use market_square::area::{AreaInner, AreaReader, AreaWriter, finish_init};
+use market_square::area::{AreaInner, AreaReader, AreaWriter, SUSPENDED_BIT, finish_init};
+use market_square::arithmetics::AtomicType;
 use market_square::cache_padded::CachePadded;
 use market_square::map::{SimpleLPHashMap, Slot, EMPTY};
 use market_square::storage::{StaticStorage, StaticSliceStorage};
@@ -34,7 +35,7 @@ static mut READER_STAGE_TICKETS: AtomicUsize = AtomicUsize::new(0);
 static mut AREA_INNER: MaybeUninit<
     AreaInner<
         u64,
-        StaticSliceStorage<Slot<CachePadded<AtomicU64>>>,
+        StaticSliceStorage<Slot<CachePadded<AtomicType>>>,
         StaticSliceStorage<UnsafeCell<MaybeUninit<u64>>>,
         StaticStorage<AtomicUsize>,
     >
@@ -49,11 +50,11 @@ unsafe fn init_area() -> (
         u64,
         StaticStorage<AreaInner<
             u64,
-            StaticSliceStorage<Slot<CachePadded<AtomicU64>>>,
+            StaticSliceStorage<Slot<CachePadded<AtomicType>>>,
             StaticSliceStorage<UnsafeCell<MaybeUninit<u64>>>,
             StaticStorage<AtomicUsize>,
         >>,
-        StaticSliceStorage<Slot<CachePadded<AtomicU64>>>,
+        StaticSliceStorage<Slot<CachePadded<AtomicType>>>,
         StaticSliceStorage<UnsafeCell<MaybeUninit<u64>>>,
         StaticStorage<AtomicUsize>,
     >,
@@ -61,11 +62,11 @@ unsafe fn init_area() -> (
         u64,
         StaticStorage<AreaInner<
             u64,
-            StaticSliceStorage<Slot<CachePadded<AtomicU64>>>,
+            StaticSliceStorage<Slot<CachePadded<AtomicType>>>,
             StaticSliceStorage<UnsafeCell<MaybeUninit<u64>>>,
             StaticStorage<AtomicUsize>,
         >>,
-        StaticSliceStorage<Slot<CachePadded<AtomicU64>>>,
+        StaticSliceStorage<Slot<CachePadded<AtomicType>>>,
         StaticSliceStorage<UnsafeCell<MaybeUninit<u64>>>,
         StaticStorage<AtomicUsize>,
     >,
@@ -75,11 +76,10 @@ unsafe fn init_area() -> (
         core::ptr::write(&raw mut BUFFER, [const { UnsafeCell::new(MaybeUninit::uninit()) }; BUFFER_CAPACITY]);
 
         // Initialize reader_gens slots with SUSPENDED_BIT (required by AreaInner)
-        const SUSPENDED_BIT: u64 = 1 << 63;
-        core::ptr::write(&raw mut READER_GENS as *mut [Slot<CachePadded<AtomicU64>>; READER_CAPACITY], [const { 
+        core::ptr::write(&raw mut READER_GENS as *mut [Slot<CachePadded<AtomicType>>; READER_CAPACITY], [const { 
             Slot {
-                key: AtomicU64::new(EMPTY),
-                value: UnsafeCell::new(MaybeUninit::new(CachePadded::new(AtomicU64::new(SUSPENDED_BIT)))),
+                key: AtomicType::new(EMPTY),
+                value: UnsafeCell::new(MaybeUninit::new(CachePadded::new(AtomicType::new(SUSPENDED_BIT)))),
             }
         }; READER_CAPACITY]);
 
@@ -94,7 +94,7 @@ unsafe fn init_area() -> (
             BUFFER_CAPACITY,
         );
         let reader_gens_storage = StaticSliceStorage::from_raw(
-            NonNull::new_unchecked(&raw mut READER_GENS as *mut Slot<CachePadded<AtomicU64>>),
+            NonNull::new_unchecked(&raw mut READER_GENS as *mut Slot<CachePadded<AtomicType>>),
             READER_CAPACITY,
         );
         
@@ -115,7 +115,7 @@ unsafe fn init_area() -> (
         AreaInner::init(
             &raw mut AREA_INNER as *mut AreaInner<
                 u64,
-                StaticSliceStorage<Slot<CachePadded<AtomicU64>>>,
+                StaticSliceStorage<Slot<CachePadded<AtomicType>>>,
                 StaticSliceStorage<UnsafeCell<MaybeUninit<u64>>>,
                 StaticStorage<AtomicUsize>,
             >,
@@ -130,7 +130,7 @@ unsafe fn init_area() -> (
         let area_storage = StaticStorage::from_raw(
             NonNull::new_unchecked(&raw mut AREA_INNER as *mut AreaInner<
                 u64,
-                StaticSliceStorage<Slot<CachePadded<AtomicU64>>>,
+                StaticSliceStorage<Slot<CachePadded<AtomicType>>>,
                 StaticSliceStorage<UnsafeCell<MaybeUninit<u64>>>,
                 StaticStorage<AtomicUsize>,
             >)

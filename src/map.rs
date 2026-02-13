@@ -2,16 +2,16 @@ use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
 };
 
-use crate::storage::{FixedStorage, FixedStorageMultiple};
+use crate::{arithmetics::{AtomicType, MSB, NumericType}, storage::{FixedStorage, FixedStorageMultiple}};
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use crate::storage::BoxedSliceStorage;
 
-pub const EMPTY: u64 = 0;
-pub const IN_PROGRESS: u64 = 1 << 63;
+pub const EMPTY: NumericType = 0;
+pub const IN_PROGRESS: NumericType = MSB; // MSB set, all other bits clear
 
 /// Use for `placement_offset`.
 pub const ZERO_OFFSET: usize = 0;
@@ -24,13 +24,13 @@ pub const MAX: usize = usize::MAX;
 
 /// Extract the logical key bits of a key.
 #[inline]
-pub fn key_bits(k: u64) -> u64 {
+pub fn key_bits(k: NumericType) -> NumericType {
     k & !IN_PROGRESS
 }
 
 /// Check if the IN_PROGRESS bit is set (also returns false if key is EMPTY).
 #[inline]
-pub fn is_in_progress(k: u64) -> bool {
+pub fn is_in_progress(k: NumericType) -> bool {
     (k & IN_PROGRESS) != 0 && k != EMPTY
 }
 
@@ -44,20 +44,20 @@ where
 }
 
 pub struct Slot<V> {
-    pub key: AtomicU64,                  // 0 = empty, else key (+optional IN_PROGRESS bit)
+    pub key: AtomicType,                  // 0 = empty, else key (+optional IN_PROGRESS bit)
     pub value: UnsafeCell<MaybeUninit<V>>,
 }
 
 impl<V> Slot<V> {
     const fn new() -> Self {
         Self {
-            key: AtomicU64::new(EMPTY),
+            key: AtomicType::new(EMPTY),
             value: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
     #[inline]
-    fn load_key(&self) -> u64 {
+    fn load_key(&self) -> NumericType {
         self.key.load(Ordering::Acquire)
     }
 }
@@ -115,7 +115,7 @@ impl<V> SimpleLPHashMap<V, BoxedSliceStorage<Slot<V>>> {
         Self {
             mask: capacity - 1,
             slots: BoxedSliceStorage::with_capacity_and_init(capacity, || Slot {
-                key: AtomicU64::new(EMPTY),
+                key: AtomicType::new(EMPTY),
                 value: UnsafeCell::new(MaybeUninit::new(init_value())),
             }),
             phantom: core::marker::PhantomData,
@@ -160,7 +160,7 @@ where
     /// - The caller must handle IN_PROGRESS state appropriately
     pub unsafe fn scan_slots<F>(&self, mut visitor: F)
     where
-        F: FnMut(usize, u64, *const V),
+        F: FnMut(usize, NumericType, *const V),
     {
         for (index, slot) in self.slots().iter().enumerate() {
             let k = slot.load_key();
@@ -175,7 +175,7 @@ where
     /// 
     /// Implicitly strips IN_PROGRESS bit since it is MSB.
     #[inline]
-    fn index_for(&self, key: u64, placement_offset: usize) -> usize {
+    fn index_for(&self, key: NumericType, placement_offset: usize) -> usize {
         ((key as usize) + placement_offset) & self.mask
     }
 
@@ -254,12 +254,12 @@ where
     /// ```
     pub unsafe fn get_or_insert_concurrent(
         &self,
-        key: u64,
+        key: NumericType,
         placement_offset: usize,
         mut n: usize,
         insert: bool,
         fold: bool,
-    ) -> (*const V, bool, usize, u64, usize) {
+    ) -> (*const V, bool, usize, NumericType, usize) {
         debug_assert!(key != EMPTY, "key must be non-zero");
         debug_assert!(key & IN_PROGRESS == 0, "keys must have MSB clear");
         debug_assert!(
@@ -282,9 +282,9 @@ where
                     // Generate a unique key by folding in the index.
                     // This is only valid if the caller does not require
                     // the key to be exactly the one provided.
-                    let mut logical_key = key.wrapping_add(placement_offset as u64).wrapping_add(i as u64);
+                    let mut logical_key = key.wrapping_add(placement_offset as NumericType).wrapping_add(i as NumericType);
                     if logical_key == 0 || logical_key == IN_PROGRESS {
-                        logical_key = logical_key.wrapping_add((self.mask + 1) as u64);
+                        logical_key = logical_key.wrapping_add((self.mask + 1) as NumericType);
                     }
                     logical_key | IN_PROGRESS
                 };
@@ -344,7 +344,7 @@ where
     /// - Must only be called when this thread has exclusive logical ownership
     ///   of the key (no other threads using this key/slot).
     /// - Caller must have logically dropped the value first if `V` needs drop.
-    pub unsafe fn remove_concurrent(&self, key: u64, placement_offset: usize, mut n: usize) -> bool {
+    pub unsafe fn remove_concurrent(&self, key: NumericType, placement_offset: usize, mut n: usize) -> bool {
         debug_assert!(key != EMPTY, "key must be non-zero");
         debug_assert!(key & IN_PROGRESS == 0, "keys must have MSB clear");
 

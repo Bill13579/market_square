@@ -3,10 +3,13 @@ use core::{
     marker::PhantomData,
     mem::MaybeUninit,
     ptr,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{map::Slot, storage::{FixedStorage, FixedStorageMultiple}};
+#[cfg(debug_assertions)]
+const SPIN_LIMIT: usize = usize::MAX;
+
+use crate::{arithmetics::{AtomicType, MSB, NumericType, gen_add_msb_masked, gen_dist_msb_masked, gen_gt_msb_masked, gen_gte_msb_masked, gen_lt_msb_masked, gen_lte_msb_masked}, map::Slot, storage::{FixedStorage, FixedStorageMultiple}};
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use crate::storage::{BoxedSliceStorage, BoxedStorage};
@@ -18,17 +21,17 @@ use rand::Rng;
 use crate::map::{self, IMMEDIATE, SimpleLPHashMap, ZERO_OFFSET};
 
 // MSB is reserved for "suspended" status on reader generation numbers
-const SUSPENDED_BIT: u64 = 1 << 63;
+pub const SUSPENDED_BIT: NumericType = MSB;
 
 /// Strip the suspended bit from a generation number
 #[inline]
-pub fn gen_without_suspended_bit(generation: u64) -> u64 {
+pub fn gen_without_suspended_bit(generation: NumericType) -> NumericType {
     generation & !SUSPENDED_BIT
 }
 
 /// Check if a generation number has the suspended bit set
 #[inline]
-pub fn is_suspended(generation: u64) -> bool {
+pub fn is_suspended(generation: NumericType) -> bool {
     (generation & SUSPENDED_BIT) != 0
 }
 
@@ -37,7 +40,7 @@ pub fn is_suspended(generation: u64) -> bool {
 pub enum ReserveError {
     /// No space available in the ring buffer (capacity check failed)
     NoSpace,
-    /// Failed to grab slots (race condition - retry might succeed)
+    /// Failed to grab slots (race condition, retry might succeed)
     FailedGrab,
 }
 
@@ -108,38 +111,38 @@ pub enum CleanupError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupResult {
     /// The old last_valid_gen before cleanup
-    pub old_last_valid: u64,
+    pub old_last_valid: NumericType,
     /// The new last_valid_gen after cleanup
-    pub new_last_valid: u64,
+    pub new_last_valid: NumericType,
     /// Number of slots cleaned
-    pub slots_cleaned: u64,
+    pub slots_cleaned: NumericType,
 }
 
 /// The shared inner state of an Area
 pub struct AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
     /// Next generation number for writing (monotonically increasing)
-    write_gen: CachePadded<AtomicU64>,
+    write_gen: CachePadded<AtomicType>,
 
     /// Current generation number published for reading (monotonically increasing)
-    read_gen: CachePadded<AtomicU64>,
+    read_gen: CachePadded<AtomicType>,
 
     /// Last generation number that is still valid (for cleanup)
-    last_valid_gen: CachePadded<AtomicU64>,
+    last_valid_gen: CachePadded<AtomicType>,
 
     /// Generation numbers that are now freed and can be reused
-    free_gen: CachePadded<AtomicU64>,
+    free_gen: CachePadded<AtomicType>,
 
     /// Number of active writers
     writers_count: CachePadded<AtomicUsize>,
 
     /// Per-reader generation numbers (with MSB as suspended flag)
-    /// Each value is CachePadded<AtomicU64> for cache-line isolation
-    reader_gens: SimpleLPHashMap<CachePadded<AtomicU64>, SReaderGens>,
+    /// Each value is CachePadded<AtomicType> for cache-line isolation
+    reader_gens: SimpleLPHashMap<CachePadded<AtomicType>, SReaderGens>,
 
     /// Ring buffer capacity
     buffer_capacity: usize,
@@ -165,14 +168,14 @@ where
 unsafe impl<T, SReaderGens, SBuf, SAtomicUsizeCounter> Send for AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     T: Send,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {}
 unsafe impl<T, SReaderGens, SBuf, SAtomicUsizeCounter> Sync for AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     T: Send,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {}
@@ -180,7 +183,7 @@ where
 #[cfg(any(feature = "std", feature = "alloc"))]
 impl<T> AreaInner<
     T,
-    BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+    BoxedSliceStorage<Slot<CachePadded<AtomicType>>>,
     BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
     BoxedStorage<AtomicUsize>
 > {
@@ -202,13 +205,13 @@ impl<T> AreaInner<
         let reader_stage_tickets = BoxedStorage::new(AtomicUsize::new(0));
 
         let inner = Self {
-            write_gen: CachePadded::new(AtomicU64::new(0)),
-            read_gen: CachePadded::new(AtomicU64::new(0)),
-            last_valid_gen: CachePadded::new(AtomicU64::new(0)),
-            free_gen: CachePadded::new(AtomicU64::new(0)),
+            write_gen: CachePadded::new(AtomicType::new(0)),
+            read_gen: CachePadded::new(AtomicType::new(0)),
+            last_valid_gen: CachePadded::new(AtomicType::new(0)),
+            free_gen: CachePadded::new(AtomicType::new(0)),
             writers_count: CachePadded::new(AtomicUsize::new(0)),
             reader_gens: SimpleLPHashMap::with_capacity_and_init(reader_capacity, || {
-                CachePadded::new(AtomicU64::new(SUSPENDED_BIT))
+                CachePadded::new(AtomicType::new(SUSPENDED_BIT))
             }),
             buffer_capacity,
             buffer,
@@ -225,7 +228,7 @@ impl<T> AreaInner<
 
 impl<T, SReaderGens, SBuf, SAtomicUsizeCounter> AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
 where
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -235,17 +238,17 @@ where
     /// - `reader_gens` must have all values initialized not to zero but to `SUSPENDED_BIT`.
     pub fn init(
         area_inner: *mut Self,
-        reader_gens: SimpleLPHashMap<CachePadded<AtomicU64>, SReaderGens>,
+        reader_gens: SimpleLPHashMap<CachePadded<AtomicType>, SReaderGens>,
         buffer: SBuf,
         destroy_stages: SAtomicUsizeCounter,
         reader_keep_alloc_tickets: SAtomicUsizeCounter,
         reader_stage_tickets: SAtomicUsizeCounter,
     ) {
         unsafe {
-            (&raw mut (*area_inner).write_gen).write(CachePadded::new(AtomicU64::new(0)));
-            (&raw mut (*area_inner).read_gen).write(CachePadded::new(AtomicU64::new(0)));
-            (&raw mut (*area_inner).last_valid_gen).write(CachePadded::new(AtomicU64::new(0)));
-            (&raw mut (*area_inner).free_gen).write(CachePadded::new(AtomicU64::new(0)));
+            (&raw mut (*area_inner).write_gen).write(CachePadded::new(AtomicType::new(0)));
+            (&raw mut (*area_inner).read_gen).write(CachePadded::new(AtomicType::new(0)));
+            (&raw mut (*area_inner).last_valid_gen).write(CachePadded::new(AtomicType::new(0)));
+            (&raw mut (*area_inner).free_gen).write(CachePadded::new(AtomicType::new(0)));
             (&raw mut (*area_inner).writers_count).write(CachePadded::new(AtomicUsize::new(0)));
             (&raw mut (*area_inner).reader_gens).write(reader_gens);
             (&raw mut (*area_inner).buffer_capacity).write(buffer.capacity());
@@ -259,39 +262,39 @@ where
 
     /// Get a mutable pointer to the slot at the given generation number
     #[inline]
-    unsafe fn get_slot_ptr_mut(&self, generation: u64) -> *mut T {
+    unsafe fn get_slot_ptr_mut(&self, generation: NumericType) -> *mut T {
         let index = (generation as usize) % self.buffer_capacity;
         unsafe { (*self.buffer.slice()[index].get()).as_mut_ptr() }
     }
 
     /// Get a const pointer to the slot at the given generation number
     #[inline]
-    unsafe fn get_slot_ptr_const(&self, generation: u64) -> *const T {
+    unsafe fn get_slot_ptr_const(&self, generation: NumericType) -> *const T {
         let index = (generation as usize) % self.buffer_capacity;
         unsafe { (*self.buffer.slice()[index].get()).as_ptr() }
     }
 
     /// Load the current write generation (non-inclusive)
     #[inline]
-    fn load_write_gen(&self) -> u64 {
+    fn load_write_gen(&self) -> NumericType {
         self.write_gen.load(Ordering::Acquire)
     }
 
     /// Load the current read generation (non-inclusive)
     #[inline]
-    fn load_read_gen(&self) -> u64 {
+    fn load_read_gen(&self) -> NumericType {
         self.read_gen.load(Ordering::Acquire)
     }
 
     /// Load the current last valid generation (inclusive)
     #[inline]
-    fn load_last_valid_gen(&self) -> u64 {
+    fn load_last_valid_gen(&self) -> NumericType {
         self.last_valid_gen.load(Ordering::Acquire)
     }
 
     /// Load the current free generation (non-inclusive)
     #[inline]
-    fn load_free_gen(&self) -> u64 {
+    fn load_free_gen(&self) -> NumericType {
         self.free_gen.load(Ordering::Acquire)
     }
 
@@ -304,22 +307,31 @@ where
     /// Try to reserve n slots for writing using CAS.
     /// Returns (start_generation, end_generation) on success.
     /// end_generation is exclusive (so the range is [start_generation, end_generation))
-    fn try_reserve_slots(&self, n: usize) -> Result<(u64, u64), ReserveError> {
+    fn try_reserve_slots(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
         debug_assert!(n != 0, "must reserve at least one slot");
 
         // Load current state
         let current_free = self.load_free_gen();
         let current_write = self.load_write_gen(); //NOTE: Must come AFTER loading current_free to be conservative about free spots being available.
-        debug_assert!(current_free <= current_write, "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
-        let available = self.buffer_capacity as u64 - (self.buffer_capacity as u64).min(current_write - current_free); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
+        debug_assert!(gen_lte_msb_masked(current_free, current_write), "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
+        let available = self.buffer_capacity as NumericType - (self.buffer_capacity as NumericType).min(gen_dist_msb_masked(current_write, current_free)); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
 
         // Check if there's enough capacity
-        if (n as u64) > available {
+        if (n as NumericType) > available {
             return Err(ReserveError::NoSpace);
         }
 
         // Try to CAS write_gen from current_write to current_write + n
-        let expected_new_write = current_write + n as u64;
+        let expected_new_write = gen_add_msb_masked(current_write, n as NumericType);
+        // Important Note: Here, it's theoretically possible now that we are wrapping that we somehow update write_gen to a value *equal* to free_gen.
+        // Usually without overflow, this isn't possible since free_gen is always behind write_gen while write_gen monotonically increases.
+        // However, if write_gen wraps, then it can become at least free_gen (it won't go beyond it on the first iteration since "available" is
+        // always at most enough on the first iteration to advance write_gen to exactly free_gen)
+        // If this happens though, the next time we try to reserve, we'll see free_gen == write_gen, and report every slot as available (because
+        // gen_dist_msb_masked(current_write, current_free) == 0), which is bad.
+        // However in practice for this to happen free_gen would have to be so behind in cleanup that the computer has probably already crashed already,
+        // since this requires 1 billion messages (for AtomicU32 for instance, 2^30 messages) to be left uncleaned on the buffer while writers keep trying to reserve
+        // more slots.
         match self.write_gen.compare_exchange(
             current_write,
             expected_new_write,
@@ -334,7 +346,7 @@ where
     /// Try to reserve up to n slots, getting as many as possible, using CAS.
     /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
     /// Never returns NoSpace - gets 0 slots if none available.
-    fn try_reserve_slots_best_effort(&self, n: usize) -> Result<(u64, u64, usize), ReserveError> {
+    fn try_reserve_slots_best_effort(&self, n: usize) -> Result<(NumericType, NumericType, usize), ReserveError> {
         if n == 0 {
             return Ok((0, 0, 0));
         }
@@ -342,16 +354,17 @@ where
         // Load current state
         let current_free = self.load_free_gen();
         let current_write = self.load_write_gen(); //NOTE: Must come AFTER loading current_free to be conservative about free spots being available.
-        debug_assert!(current_free <= current_write, "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
-        let available = self.buffer_capacity as u64 - (self.buffer_capacity as u64).min(current_write - current_free); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
-        let actual_n = (n as u64).min(available);
+        debug_assert!(gen_lte_msb_masked(current_free, current_write), "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
+        let available = self.buffer_capacity as NumericType - (self.buffer_capacity as NumericType).min(gen_dist_msb_masked(current_write, current_free)); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
+        let actual_n = (n as NumericType).min(available);
 
         if actual_n == 0 {
             return Ok((0, 0, 0));
         }
 
         // Try to CAS write_gen from current_write to current_write + actual
-        let expected_new_write = current_write + actual_n;
+        let expected_new_write = gen_add_msb_masked(current_write, actual_n);
+        // See "Important Note" from try_reserve_slots above.
         match self.write_gen.compare_exchange(
             current_write,
             expected_new_write,
@@ -368,10 +381,10 @@ where
     /// Uses CAS to ensure no one else published in between.
     fn publish_slots(
         &self,
-        start_generation: u64,
-        end_generation: u64,
+        start_generation: NumericType,
+        end_generation: NumericType,
     ) -> Result<(), PublishError> {
-        if start_generation >= end_generation {
+        if gen_gte_msb_masked(start_generation, end_generation) {
             return Ok(());
         }
 
@@ -390,26 +403,26 @@ where
     /// Register a new reader, returning a unique reader ID.
     /// Uses CAS to enter from suspended state, retries on CAS failure.
     #[cfg(feature = "std")]
-    fn register_reader(&self) -> Result<u64, RegisterError> {
+    fn register_reader(&self) -> Result<NumericType, RegisterError> {
         // Generate a random reader ID using thread RNG
         let mut rng = rand::rng();
-        let seed = rng.random::<u64>();
+        let seed = rng.random::<NumericType>();
 
         self.register_reader_with_seed(seed)
     }
 
     /// Register a new reader, with the provided reader ID seed. Note that the provided reader ID will be used to generate a unique reader ID, which is what will actually be used.
     /// Uses CAS to enter from suspended state, retries on CAS failure.
-    fn register_reader_with_seed(&self, mut seed: u64) -> Result<u64, RegisterError> {
+    fn register_reader_with_seed(&self, mut seed: NumericType) -> Result<NumericType, RegisterError> {
         // Ensure seed doesn't have MSB set
-        seed = seed & !(1 << 63);
+        seed = seed & !MSB;
         if seed == 0 {
             seed = 1;
         }
 
         // Use folded insertion to get a unique reader ID
         unsafe {
-            let (ptr, is_new, _, reader_id_raw, index): (*const CachePadded<AtomicU64>, _, _, _, _) = self.reader_gens.get_or_insert_concurrent(
+            let (ptr, is_new, _, reader_id_raw, index): (*const CachePadded<AtomicType>, _, _, _, _) = self.reader_gens.get_or_insert_concurrent(
                 seed,
                 ZERO_OFFSET,
                 self.reader_gens.capacity(),
@@ -427,12 +440,12 @@ where
             let reader_id = map::key_bits(reader_id_raw);
 
             // Ensure the reader ID is valid (no MSB set)
-            debug_assert!(reader_id != 0 && (reader_id & (1 << 63)) == 0);
+            debug_assert!(reader_id != 0 && (reader_id & MSB) == 0);
 
-            // Initialize the CachePadded<AtomicU64>
+            // Initialize the CachePadded<AtomicType>
             // Pre-initialized value is SUSPENDED_BIT (or dragged forward by cleanup), we'll CAS it to entry generation
             // We MUST NOT overwrite the value here, as it may contain a forced update from cleanup.
-            // ptr.write(CachePadded::new(AtomicU64::new(SUSPENDED_BIT)));
+            // ptr.write(CachePadded::new(AtomicType::new(SUSPENDED_BIT)));
             self.reader_gens.finish_init_at(index);
 
             // Now CAS from suspended state to active, like resume does
@@ -461,11 +474,11 @@ where
     #[inline(always)]
     fn get_reader_ptr_boilerplate(
         &self,
-        reader_id: u64,
+        reader_id: NumericType,
         func_name: &str,
-    ) -> Option<*const CachePadded<AtomicU64>> {
+    ) -> Option<*const CachePadded<AtomicType>> {
         unsafe {
-            let (ptr, is_new, _, _, _): (*const CachePadded<AtomicU64>, _, _, _, _) = self.reader_gens.get_or_insert_concurrent(
+            let (ptr, is_new, _, _, _): (*const CachePadded<AtomicType>, _, _, _, _) = self.reader_gens.get_or_insert_concurrent(
                 reader_id,
                 ZERO_OFFSET,
                 IMMEDIATE,
@@ -491,7 +504,7 @@ where
     }
 
     /// Get the current generation number for a reader; also might include the suspended bit
-    fn get_reader_gen(&self, reader_id: u64) -> Option<u64> {
+    fn get_reader_gen(&self, reader_id: NumericType) -> Option<NumericType> {
         unsafe {
             let ptr = self.get_reader_ptr_boilerplate(reader_id, "get_reader_gen")?;
 
@@ -500,8 +513,8 @@ where
         }
     }
 
-    /// Try to set the reader's generation number (for advancing); fails if the reader is suspended
-    fn set_reader_gen(&self, reader_id: u64, new_generation: u64) -> Result<(), SetGenError> {
+    /// Try to set the reader's generation number (for advancing); fails if the reader is suspended or if the new_generation is older or equal to the current generation (this is not allowed since the contract is that readers acknowledge any generations older than their current stated generation is not guaranteed to still exist, so setting to an older generation would be lying and could cause undefined behavior) (the equal case also errors to save on an equality check).
+    fn set_reader_gen(&self, reader_id: NumericType, new_generation: NumericType) -> Result<(), SetGenError> {
         unsafe {
             let ptr = self.get_reader_ptr_boilerplate(reader_id, "set_reader_gen").ok_or(SetGenError::ReaderNotFound)?;
 
@@ -514,7 +527,7 @@ where
             }
 
             // Don't allow setting to a value less than current (this is non-negotiable, since the contract is that readers acknowledge any generations older than their current stated generation is not guaranteed to still exist)
-            if new_generation < current {
+            if gen_lte_msb_masked(new_generation, current) {
                 return Err(SetGenError::InvalidGeneration);
             }
 
@@ -525,7 +538,7 @@ where
     }
 
     /// Mark a reader as suspended by setting the MSB on their generation number
-    fn suspend_reader(&self, reader_id: u64) -> Result<(), SuspendError> {
+    fn suspend_reader(&self, reader_id: NumericType) -> Result<(), SuspendError> {
         unsafe {
             let ptr = self.get_reader_ptr_boilerplate(reader_id, "suspend_reader").ok_or(SuspendError::ReaderNotFound)?;
 
@@ -547,7 +560,7 @@ where
 
     /// Resume a reader from suspended state at the current valid generation.
     /// Retries on CAS failure.
-    fn resume_reader(&self, reader_id: u64) -> Result<bool, ResumeError> {
+    fn resume_reader(&self, reader_id: NumericType) -> Result<bool, ResumeError> {
         unsafe {
             let ptr = self.get_reader_ptr_boilerplate(reader_id, "resume_reader").ok_or(ResumeError::ReaderNotFound)?;
 
@@ -579,7 +592,7 @@ where
     /// Try to resume a reader from suspended state at a specific entry_generation.
     /// Fails if entry_generation is older than the current forced minimum.
     /// Retries on CAS failure.
-    fn resume_reader_at(&self, reader_id: u64, entry_generation: u64) -> Result<bool, ResumeError> {
+    fn resume_reader_at(&self, reader_id: NumericType, entry_generation: NumericType) -> Result<bool, ResumeError> {
         unsafe {
             let ptr = self.get_reader_ptr_boilerplate(reader_id, "resume_reader_at").ok_or(ResumeError::ReaderNotFound)?;
 
@@ -593,7 +606,7 @@ where
 
                 // Validate that entry_generation is at least the current value (without suspend bit)
                 let current_gen_without_suspend = gen_without_suspended_bit(current);
-                if entry_generation < current_gen_without_suspend {
+                if gen_lt_msb_masked(entry_generation, current_gen_without_suspend) {
                     return Err(ResumeError::GenerationTooOld);
                 }
 
@@ -614,7 +627,7 @@ where
     }
 
     /// Unregister a reader, removing their entry from the reader_gens map
-    fn unregister_reader(&self, reader_id: u64) -> Result<(), UnregisterError> {
+    fn unregister_reader(&self, reader_id: NumericType) -> Result<(), UnregisterError> {
         // Suspend the reader first so that if the slot is reused or scanned by cleanup,
         // it holds a safe value (SUSPENDED_BIT).
         match self.suspend_reader(reader_id) {
@@ -636,7 +649,7 @@ where
         let mut last_valid = self.load_last_valid_gen();
         let read_gen = self.load_read_gen();
 
-        if last_valid >= read_gen {
+        if gen_gte_msb_masked(last_valid, read_gen) {
             return Err(CleanupError::NothingToClean);
         }
 
@@ -660,30 +673,38 @@ where
                 'inner: while is_suspended(reader_gen) {
                     let current_gen_without_suspend = gen_without_suspended_bit(reader_gen);
 
-                    // The new re-entry minimum we want to advance suspended readers to
-                    let forced_update = min_held_gen.max(current_gen_without_suspend);
+                    // Force the reader forward if our current min_held_gen is greater than this reader's generation
+                    if gen_gt_msb_masked(min_held_gen, current_gen_without_suspend) {
+                        // The new re-entry minimum we want to advance suspended readers to
+                        let forced_update = min_held_gen;
 
-                    // Try to CAS the reader's gen to the forced update with suspended bit
-                    match (**ptr).compare_exchange(
-                        reader_gen,
-                        forced_update | SUSPENDED_BIT,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            // If we succeed in forcing the update, we are done with this slot.
-                            continue 'outer;
-                        },
-                        Err(actual) => {
-                            // If we fail in forcing the update, either the reader was unsuspended and we need to treat it as normal, or the reader is still suspended and we can retry.
-                            reader_gen = actual;
-                            continue 'inner;
+                        // Try to CAS the reader's gen to the forced update with suspended bit
+                        match (**ptr).compare_exchange(
+                            reader_gen,
+                            forced_update | SUSPENDED_BIT,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                // If we succeed in forcing the update, we are done with this slot.
+                                continue 'outer;
+                            },
+                            Err(actual) => {
+                                // If we fail in forcing the update, either the reader was unsuspended and we need to treat it as normal, or the reader is still suspended and we can retry.
+                                reader_gen = actual;
+                                continue 'inner;
+                            }
                         }
+                    } else {
+                        continue 'outer;
                     }
                 }
 
                 // Reader is active, so track their generation
-                min_held_gen = min_held_gen.min(reader_gen);
+                // Update min_held_gen if our current min_held_gen is greater than this reader's generation
+                if gen_gte_msb_masked(min_held_gen, reader_gen) {
+                    min_held_gen = reader_gen;
+                }
             }
         }
 
@@ -691,7 +712,7 @@ where
 
         // Loop while we can make progress
         loop {
-            if new_last_valid <= last_valid {
+            if gen_lte_msb_masked(new_last_valid, last_valid) {
                 // Either there was nothing to clean, or if we are on the second iteration and beyond, other threads have cleaned everything we wanted to clean.
                 return Err(CleanupError::NothingToClean);
             }
@@ -706,11 +727,12 @@ where
             ) {
                 Ok(_) => {
                     // Successfully updated. Now we need to drop items in [last_valid, new_last_valid)
-                    let slots_cleaned = new_last_valid - last_valid;
+                    let slots_cleaned = gen_dist_msb_masked(new_last_valid, last_valid);
 
                     // Drop items if T needs drop
                     if core::mem::needs_drop::<T>() {
-                        for generation in last_valid..new_last_valid {
+                        for generation_offset in 0..slots_cleaned {
+                            let generation = gen_add_msb_masked(last_valid, generation_offset);
                             unsafe {
                                 let ptr = self.get_slot_ptr_mut(generation);
                                 ptr::drop_in_place(ptr);
@@ -719,7 +741,17 @@ where
                     }
 
                     // Update free_gen to allow writers to reuse the slots we just freed
+                    #[cfg(debug_assertions)]
+                    let mut tr = 0;
                     loop {
+                        #[cfg(debug_assertions)]
+                        {
+                            tr += 1;
+                            if tr >= SPIN_LIMIT {
+                                panic!("SPIN_LIMIT reached! (try_cleanup_old_slots free_gen update, waiting for another cleanup thread to finish; cleanup threads must finish sequentially, so slow cleanup threads can block other cleanup threads from exiting even if they've finished their own cleanup work)");
+                            }
+                        }
+
                         match self.free_gen.compare_exchange(
                             last_valid,
                             new_last_valid,
@@ -767,7 +799,7 @@ where
 pub struct AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -779,7 +811,7 @@ unsafe impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Send for AreaWriter
 where 
     T: Send,
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {}
@@ -787,7 +819,7 @@ unsafe impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Sync for AreaWriter
 where 
     T: Send,
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {}
@@ -795,7 +827,7 @@ where
 impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Copy + Clone,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -814,7 +846,7 @@ pub trait AreaWriterTrait<T> {
     /// Try to reserve n slots for writing.
     /// Returns (start_generation, end_generation) on success.
     /// end_generation is exclusive (so the range is [start_generation, end_generation)).
-    fn try_reserve_slots(&self, n: usize) -> Result<(u64, u64), ReserveError>;
+    fn try_reserve_slots(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError>;
 
     /// Try to reserve up to n slots, getting as many as possible.
     /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
@@ -823,13 +855,13 @@ pub trait AreaWriterTrait<T> {
     fn try_reserve_slots_best_effort(
         &self,
         n: usize,
-    ) -> Result<(u64, u64, usize), ReserveError>;
+    ) -> Result<(NumericType, NumericType, usize), ReserveError>;
 
     /// Publish slots in the range [start_generation, end_generation) for readers.
     fn publish_slots(
         &self,
-        start_generation: u64,
-        end_generation: u64,
+        start_generation: NumericType,
+        end_generation: NumericType,
     ) -> Result<(), PublishError>;
 
     /// Get a mutable pointer to the slot at the given generation number.
@@ -838,7 +870,7 @@ pub trait AreaWriterTrait<T> {
     /// - generation must be within a range you reserved via try_reserve_slots
     /// - You must initialize the slot before calling publish_slots
     /// - You MUST NOT access the slot after publishing (use a separate AreaReader for that)
-    unsafe fn get_slot_ptr(&self, generation: u64) -> *mut T;
+    unsafe fn get_slot_ptr(&self, generation: NumericType) -> *mut T;
 }
 
 macro_rules! impl_writer_functionality {
@@ -847,7 +879,7 @@ macro_rules! impl_writer_functionality {
             impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaWriterTrait<T> for $name<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
             where 
                 Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-                SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+                SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
                 SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
                 SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
             {
@@ -855,7 +887,7 @@ macro_rules! impl_writer_functionality {
                 /// Returns (start_generation, end_generation) on success.
                 /// end_generation is exclusive (so the range is [start_generation, end_generation)).
                 #[inline]
-                fn try_reserve_slots(&self, n: usize) -> Result<(u64, u64), ReserveError> {
+                fn try_reserve_slots(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
                     unsafe { self.inner.as_ref().try_reserve_slots(n) }
                 }
 
@@ -867,7 +899,7 @@ macro_rules! impl_writer_functionality {
                 fn try_reserve_slots_best_effort(
                     &self,
                     n: usize,
-                ) -> Result<(u64, u64, usize), ReserveError> {
+                ) -> Result<(NumericType, NumericType, usize), ReserveError> {
                     unsafe { self.inner.as_ref().try_reserve_slots_best_effort(n) }
                 }
 
@@ -875,8 +907,8 @@ macro_rules! impl_writer_functionality {
                 #[inline]
                 fn publish_slots(
                     &self,
-                    start_generation: u64,
-                    end_generation: u64,
+                    start_generation: NumericType,
+                    end_generation: NumericType,
                 ) -> Result<(), PublishError> {
                     unsafe {
                         self.inner
@@ -892,7 +924,7 @@ macro_rules! impl_writer_functionality {
                 /// - You must initialize the slot before calling publish_slots
                 /// - You MUST NOT access the slot after publishing (use a separate AreaReader for that)
                 #[inline]
-                unsafe fn get_slot_ptr(&self, generation: u64) -> *mut T {
+                unsafe fn get_slot_ptr(&self, generation: NumericType) -> *mut T {
                     unsafe { self.inner.as_ref().get_slot_ptr_mut(generation) }
                 }
             }
@@ -900,7 +932,7 @@ macro_rules! impl_writer_functionality {
             impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> $name<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
             where 
                 Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Copy + Clone,
-                SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+                SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
                 SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
                 SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
             {
@@ -921,7 +953,7 @@ macro_rules! impl_writer_functionality {
                 /// Returns a RAII guard that must be published.
                 pub fn reserve_best_effort(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
                     let (start, end, count) = self.try_reserve_slots_best_effort(n)?;
-                    debug_assert!(end - start == count as u64);
+                    debug_assert!(gen_dist_msb_masked(end, start) == count as NumericType);
                     Ok(Reservation {
                         writer: self,
                         start_gen: start,
@@ -935,7 +967,7 @@ macro_rules! impl_writer_functionality {
             impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> $name<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
             where 
                 Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-                SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+                SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
                 SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
                 SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
             {
@@ -953,7 +985,7 @@ impl_writer_functionality!(AreaWriter, AreaReader);
 impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -967,7 +999,7 @@ where
 impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Drop for AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1012,8 +1044,8 @@ where
     W: AreaWriterTrait<T>
 {
     writer: &'a W,
-    start_gen: u64,
-    end_gen: u64,
+    start_gen: NumericType,
+    end_gen: NumericType,
     published: bool,
     phantom: PhantomData<T>,
 }
@@ -1024,12 +1056,12 @@ where
 {
     /// Get the number of reserved slots
     pub fn len(&self) -> usize {
-        (self.end_gen - self.start_gen) as usize
+        gen_dist_msb_masked(self.end_gen, self.start_gen) as usize
     }
 
     /// Check if the reservation is empty
     pub fn is_empty(&self) -> bool {
-        self.start_gen >= self.end_gen
+        gen_gte_msb_masked(self.start_gen, self.end_gen)
     }
 
     /// Get a mutable reference to the slot at the given index within the reservation.
@@ -1038,7 +1070,7 @@ where
         if index >= self.len() {
             return None;
         }
-        let generation = self.start_gen + index as u64;
+        let generation = gen_add_msb_masked(self.start_gen, index as NumericType);
         unsafe {
             let ptr = self.writer.get_slot_ptr(generation);
             // SAFETY:
@@ -1071,7 +1103,18 @@ where
     /// If you have not initialized all slots in the reservation before calling this, readers will see uninitialized data and cause undefined behavior.
     pub unsafe fn publish_spin(self) {
         let mut reservation = self;
+
+        #[cfg(debug_assertions)]
+        let mut tr = 0;
         while let Err(returned) = unsafe { reservation.publish() } {
+            #[cfg(debug_assertions)]
+            {
+                tr += 1;
+                if tr >= SPIN_LIMIT {
+                    panic!("SPIN_LIMIT reached! (publish_spin)");
+                }
+            }
+
             reservation = returned;
             core::hint::spin_loop();
         }
@@ -1089,7 +1132,7 @@ where
         // Mark self as published so it doesn't panic on drop
         self.published = true;
 
-        let split_gen = self.start_gen + index as u64;
+        let split_gen = gen_add_msb_masked(self.start_gen, index as NumericType);
 
         let left = Reservation {
             writer: self.writer,
@@ -1131,26 +1174,26 @@ where
 pub struct AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
     inner: Area,
-    reader_id: u64,
+    reader_id: NumericType,
     phantom: PhantomData<(T, SReaderGens, SBuf, SAtomicUsizeCounter)>,
 }
 
 unsafe impl<T: Send, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Send for AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> 
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {}
 unsafe impl<T: Send, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Sync for AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> 
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {}
@@ -1158,7 +1201,7 @@ where
 impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Copy + Clone,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1181,7 +1224,7 @@ where
     /// **Seed must not be 0, or have the MSB set.**
     /// 
     /// Uses the provided seed ID for reader ID generation. The actual ID will be a unique one derived from the seed.
-    pub fn create_reader_with_seed(&self, seed: u64) -> Result<Self, RegisterError> {
+    pub fn create_reader_with_seed(&self, seed: NumericType) -> Result<Self, RegisterError> {
         unsafe {
             let inner = self.inner.as_ref();
             let reader_id = inner.register_reader_with_seed(seed)?;
@@ -1197,12 +1240,12 @@ where
 impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
-    /// Get the current generation number for this reader
-    pub fn get_gen(&self) -> u64 {
+    /// Get the current generation number for this reader, including the suspended bit if it's set
+    pub fn get_gen(&self) -> NumericType {
         unsafe {
             self.inner
                 .as_ref()
@@ -1212,14 +1255,23 @@ where
     }
 
     /// Load the current published read generation
-    pub fn load_read_gen(&self) -> u64 {
+    pub fn load_read_gen(&self) -> NumericType {
         unsafe { self.inner.as_ref().load_read_gen() }
     }
 
+    /// Try to set the reader's generation number (for advancing); fails if the reader is suspended or if the new_generation is older or equal to the current generation (this is not allowed since the contract is that readers acknowledge any generations older than their current stated generation is not guaranteed to still exist, so setting to an older generation would be lying and could cause undefined behavior) (the equal case also errors to save on an equality check).
+    fn set_reader_gen(&mut self, new_generation: NumericType) -> Result<(), SetGenError> {
+        unsafe {
+            self.inner
+                .as_ref()
+                .set_reader_gen(self.reader_id, new_generation)
+        }
+    }
+
     /// Advance this reader's generation by n messages
-    fn advance(&mut self, n: u64) -> Result<(), SetGenError> {
+    fn advance(&mut self, n: NumericType) -> Result<(), SetGenError> {
         let current = self.get_gen();
-        let new_generation = gen_without_suspended_bit(current) + n;
+        let new_generation = gen_add_msb_masked(gen_without_suspended_bit(current), n);
         unsafe {
             self.inner
                 .as_ref()
@@ -1233,7 +1285,7 @@ where
     /// - generation must be >= your reader's current generation
     /// - generation must be < the current read_gen (i.e., must be published)
     /// - You must not access the slot after advancing past it
-    unsafe fn get_slot_ptr(&self, generation: u64) -> *const T {
+    unsafe fn get_slot_ptr(&self, generation: NumericType) -> *const T {
         unsafe { self.inner.as_ref().get_slot_ptr_const(generation) }
     }
 
@@ -1248,7 +1300,7 @@ where
     }
 
     /// Try to resume from suspended state at the given entry_generation
-    pub fn resume_at(&mut self, entry_generation: u64) -> Result<bool, ResumeError> {
+    pub fn resume_at(&mut self, entry_generation: NumericType) -> Result<bool, ResumeError> {
         unsafe {
             self.inner
                 .as_ref()
@@ -1266,7 +1318,7 @@ where
 impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Drop for AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1302,8 +1354,18 @@ where
                 return;
             }
 
-            // Step 9: We're attempting to free - wait for reader_keep_alloc_tickets to hit 0
+            // Step 9: We're attempting to free, wait for reader_keep_alloc_tickets to hit 0
+            #[cfg(debug_assertions)]
+            let mut tr = 0;
             while keep_alloc.load(Ordering::Acquire) != 0 {
+                #[cfg(debug_assertions)]
+                {
+                    tr += 1;
+                    if tr >= SPIN_LIMIT {
+                        panic!("SPIN_LIMIT reached! (AreaReader drop, waiting for reader_keep_alloc_tickets to hit 0)");
+                    }
+                }
+
                 core::hint::spin_loop();
             }
 
@@ -1341,20 +1403,20 @@ where
 pub struct ReadSlice<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
     reader: &'a mut AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>,
-    start_gen: u64,
-    end_gen: u64,
+    start_gen: NumericType,
+    end_gen: NumericType,
     armed: bool,
 }
 
 impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> ReadSlice<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1365,8 +1427,8 @@ where
     /// - start_gen and end_gen must be valid generation numbers
     pub unsafe fn new_disarmed(
         reader: &'a mut AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>,
-        start_gen: u64,
-        end_gen: u64,
+        start_gen: NumericType,
+        end_gen: NumericType,
     ) -> Self {
         Self {
             reader,
@@ -1389,7 +1451,7 @@ where
     ///
     /// # Safety
     /// - The caller must ensure the reader is advanced appropriately
-    pub unsafe fn into_raw_parts(self) -> (&'a mut AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>, u64, u64, bool) {
+    pub unsafe fn into_raw_parts(self) -> (&'a mut AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>, NumericType, NumericType, bool) {
         let manually_dropped_s = core::mem::ManuallyDrop::new(self);
 
         let reader;
@@ -1408,12 +1470,12 @@ where
 
     /// Get the number of messages in this slice
     pub fn len(&self) -> usize {
-        (self.end_gen - self.start_gen) as usize
+        gen_dist_msb_masked(self.end_gen, self.start_gen) as usize
     }
 
     /// Check if the slice is empty
     pub fn is_empty(&self) -> bool {
-        self.start_gen >= self.end_gen
+        gen_gte_msb_masked(self.start_gen, self.end_gen)
     }
 
     /// Get a reference to the message at the given index
@@ -1421,7 +1483,7 @@ where
         if index >= self.len() {
             return None;
         }
-        let generation = self.start_gen + index as u64;
+        let generation = gen_add_msb_masked(self.start_gen, index as NumericType);
         unsafe {
             let ptr = self.reader.get_slot_ptr(generation);
             Some(&*ptr)
@@ -1446,7 +1508,7 @@ where
         let start_idx = (self.start_gen as usize) % cap;
 
         // Calculate the length of the first segment
-        let len = (self.end_gen - self.start_gen) as usize;
+        let len = gen_dist_msb_masked(self.end_gen, self.start_gen) as usize;
 
         unsafe {
             let buffer_ptr = self.reader.inner.as_ref().buffer.as_ptr().as_ptr() as *const T;
@@ -1476,7 +1538,7 @@ where
 impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Drop for ReadSlice<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1497,17 +1559,14 @@ where
         }
 
         // Automatically advance the reader past all messages in this slice
-        let n = self.end_gen - self.start_gen;
-        if n > 0 {
-            let _ = self.reader.advance(n);
-        }
+        let _ = self.reader.set_reader_gen(self.end_gen);
     }
 }
 
 impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1567,7 +1626,7 @@ where
 pub struct ReadSliceIter<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1578,7 +1637,7 @@ where
 impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Iterator for ReadSliceIter<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1599,7 +1658,7 @@ where
 impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> ExactSizeIterator for ReadSliceIter<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {}
@@ -1613,11 +1672,11 @@ pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (
         T,
         BoxedStorage<AreaInner<
             T,
-            BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+            BoxedSliceStorage<Slot<CachePadded<AtomicType>>>,
             BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
             BoxedStorage<AtomicUsize>,
         >>,
-        BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+        BoxedSliceStorage<Slot<CachePadded<AtomicType>>>,
         BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
         BoxedStorage<AtomicUsize>
     >,
@@ -1625,11 +1684,11 @@ pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (
         T,
         BoxedStorage<AreaInner<
             T,
-            BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+            BoxedSliceStorage<Slot<CachePadded<AtomicType>>>,
             BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
             BoxedStorage<AtomicUsize>,
         >>,
-        BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+        BoxedSliceStorage<Slot<CachePadded<AtomicType>>>,
         BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
         BoxedStorage<AtomicUsize>
     >
@@ -1674,7 +1733,7 @@ pub fn finish_init<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>(inner: Area)
 ) 
 where 
     Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Clone,
-    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
@@ -1726,7 +1785,7 @@ mod tests {
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
-                ptr.write(generation * 10);
+                ptr.write(generation as u64 * 10);
             }
         }
 
@@ -1862,7 +1921,7 @@ mod tests {
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
-                ptr.write(generation + 100);
+                ptr.write(generation as u64 + 100);
             }
         }
         writer.publish_slots(start, end).expect("Failed to publish");
@@ -1879,7 +1938,7 @@ mod tests {
             for generation in reader_gen..read_gen {
                 let ptr = reader.get_slot_ptr(generation);
                 let value = ptr.read();
-                assert_eq!(value, generation + 100);
+                assert_eq!(value, generation as u64 + 100);
             }
         }
     }
@@ -1928,7 +1987,7 @@ mod tests {
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
-                ptr.write(generation * 2);
+                ptr.write(generation as u64 * 2);
             }
         }
         writer.publish_slots(start, end).expect("Failed to publish");
@@ -2026,7 +2085,7 @@ mod tests {
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
-                ptr.write(generation);
+                ptr.write(generation as u64);
             }
         }
         writer.publish_slots(start, end).expect("Failed to publish");
@@ -2133,7 +2192,7 @@ mod tests {
         unsafe {
             for generation in start1..end1 {
                 let ptr = writer1.get_slot_ptr(generation);
-                ptr.write(generation);
+                ptr.write(generation as u64);
             }
         }
 
@@ -2142,7 +2201,7 @@ mod tests {
         unsafe {
             for generation in start2..end2 {
                 let ptr = writer2.get_slot_ptr(generation);
-                ptr.write(generation);
+                ptr.write(generation as u64);
             }
         }
 
@@ -2179,7 +2238,7 @@ mod tests {
             unsafe {
                 for generation in start..end {
                     let ptr = writer.get_slot_ptr(generation);
-                    ptr.write(generation);
+                    ptr.write(generation as u64);
                 }
             }
             writer.publish_slots(start, end).expect("Failed to publish");
@@ -2198,7 +2257,7 @@ mod tests {
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
-                ptr.write(generation * 100);
+                ptr.write(generation as u64 * 100);
             }
         }
         writer.publish_slots(start, end).expect("Failed to publish");
@@ -2239,7 +2298,7 @@ mod tests {
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
-                ptr.write(generation * 10);
+                ptr.write(generation as u64 * 10);
             }
         }
         writer.publish_slots(start, end).expect("Failed to publish");
@@ -2263,7 +2322,7 @@ mod tests {
         let (start, end) = writer.try_reserve_slots(10).unwrap();
         unsafe {
             for i in start..end {
-                writer.get_slot_ptr(i).write(i);
+                writer.get_slot_ptr(i).write(i as u64);
             }
         }
         writer.publish_slots(start, end).unwrap();

@@ -3,13 +3,14 @@ use std::thread;
 use std::time::Instant;
 use market_square::area::area;
 use crossbeam_channel::{TryRecvError, TrySendError, bounded};
+use market_square::arithmetics::NumericType;
 
 const N_WRITERS: usize = 5; //writers contend for a single atomic; more writers increase contention for that CAS operation
 const M_READERS: usize = 5; //market_square scales very well with readers
 //each reader and writer constitutes a thread; as with many lock-free algorithms, performance degrade if there are vastly more threads than CPU cores, especially with spin-waiting
 const MESSAGES_PER_WRITER: usize = 1_000_000;
 const BUFFER_CAPACITY: usize = 16384; //higher capacities reduce waits
-const BATCH_SIZE: usize = 64; //try 1, 16, 32; higher batch sizes improve throughput
+const BATCH_SIZE: usize = 4; //try 1, 16, 32; higher batch sizes improve throughput
 
 fn main() {
     println!("Benchmarking with:");
@@ -42,7 +43,7 @@ fn benchmark_market_square() {
     for i in 0..M_READERS {
         // Use create_reader if you have std, as it will provide better performance through randomized seeding.
         // If you use this though, **seed must not be 0, or have the MSB set.**
-        let mut reader = reader.create_reader_with_seed(100 + i as u64).unwrap();
+        let mut reader = reader.create_reader_with_seed(100 + i as NumericType).unwrap();
         reader_handles.push(thread::spawn(move || {
             let mut count = 0;
             let total_expected = (N_WRITERS * MESSAGES_PER_WRITER) as u64;
