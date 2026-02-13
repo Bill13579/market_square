@@ -34,7 +34,7 @@ use core::ops::{Deref, DerefMut};
 /// Alignment and padding:
 ///
 /// ```
-/// use crossbeam_utils::CachePadded;
+/// use market_square::cache_padded::CachePadded;
 ///
 /// let array = [CachePadded::new(1i8), CachePadded::new(2i8)];
 /// let addr1 = &*array[0] as *const i8 as usize;
@@ -50,7 +50,7 @@ use core::ops::{Deref, DerefMut};
 /// each other's cache lines:
 ///
 /// ```
-/// use crossbeam_utils::CachePadded;
+/// use market_square::cache_padded::CachePadded;
 /// use std::sync::atomic::AtomicUsize;
 ///
 /// struct Queue<T> {
@@ -172,7 +172,7 @@ impl<T> CachePadded<T> {
     /// # Examples
     ///
     /// ```
-    /// use crossbeam_utils::CachePadded;
+    /// use market_square::cache_padded::CachePadded;
     ///
     /// let padded_value = CachePadded::new(1);
     /// ```
@@ -185,7 +185,7 @@ impl<T> CachePadded<T> {
     /// # Examples
     ///
     /// ```
-    /// use crossbeam_utils::CachePadded;
+    /// use market_square::cache_padded::CachePadded;
     ///
     /// let padded_value = CachePadded::new(7);
     /// let value = padded_value.into_inner();
@@ -227,5 +227,33 @@ impl<T> From<T> for CachePadded<T> {
 impl<T: fmt::Display> fmt::Display for CachePadded<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.value, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(all(not(feature = "no-cache-pad"), any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64")))]
+    #[test]
+    fn check_cache_padding() {
+        // On x86_64/aarch64/powerpc64, expect 128
+        // On arm/mips/sparc/hexagon, expect 32
+        // On m68k, expect 16
+        // On s390x, expect 256
+        // On others (including x86, wasm, riscv), expect 64
+        {
+            assert_eq!(core::mem::align_of::<CachePadded<u8>>(), 128);
+            assert_eq!(core::mem::size_of::<CachePadded<u8>>(), 128);
+        }
+    }
+
+    #[cfg(feature = "no-cache-pad")]
+    #[test]
+    fn check_no_cache_pad_feature_flag() {
+        {
+            assert_eq!(core::mem::align_of::<CachePadded<u8>>(), 4);
+            assert_eq!(core::mem::size_of::<CachePadded<u8>>(), 4);
+        }
     }
 }
