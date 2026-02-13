@@ -2,18 +2,16 @@ use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::{self, NonNull},
+    ptr,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
-#[cfg(all(feature = "alloc", not(feature = "std")))]
-extern crate alloc;
-#[cfg(feature = "std")]
-extern crate std as alloc;
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+use crate::{map::Slot, storage::{FixedStorage, FixedStorageMultiple}};
 
-use crossbeam_utils::CachePadded;
+#[cfg(any(feature = "std", feature = "alloc"))]
+use crate::storage::{BoxedSliceStorage, BoxedStorage};
+
+use crate::cache_padded::CachePadded;
 #[cfg(feature = "std")]
 use rand::Rng;
 
@@ -118,7 +116,12 @@ pub struct CleanupResult {
 }
 
 /// The shared inner state of an Area
-struct AreaInner<T> {
+pub struct AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     /// Next generation number for writing (monotonically increasing)
     write_gen: CachePadded<AtomicU64>,
 
@@ -136,33 +139,53 @@ struct AreaInner<T> {
 
     /// Per-reader generation numbers (with MSB as suspended flag)
     /// Each value is CachePadded<AtomicU64> for cache-line isolation
-    reader_gens: SimpleLPHashMap<CachePadded<AtomicU64>>,
+    reader_gens: SimpleLPHashMap<CachePadded<AtomicU64>, SReaderGens>,
 
     /// Ring buffer capacity
     buffer_capacity: usize,
 
     /// Ring buffer storage
-    buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    buffer: SBuf,
 
     /// Destruction stages counter (leaked, separately allocated)
     /// Starts at 2 (1 for writers, 1 for readers collectively)
-    destroy_stages: NonNull<AtomicUsize>,
+    destroy_stages: SAtomicUsizeCounter,
 
     /// Reader keep-alloc tickets (leaked, separately allocated)
     /// Used to gate non-competing reader destructors
-    reader_keep_alloc_tickets: NonNull<AtomicUsize>,
+    reader_keep_alloc_tickets: SAtomicUsizeCounter,
 
     /// Reader stage tickets (leaked, separately allocated)
     /// Count of readers competing to decrement destroy_stages
-    reader_stage_tickets: NonNull<AtomicUsize>,
+    reader_stage_tickets: SAtomicUsizeCounter,
+
+    phantom: PhantomData<T>,
 }
 
-unsafe impl<T: Send> Send for AreaInner<T> {}
-unsafe impl<T: Send> Sync for AreaInner<T> {}
+unsafe impl<T, SReaderGens, SBuf, SAtomicUsizeCounter> Send for AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    T: Send,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{}
+unsafe impl<T, SReaderGens, SBuf, SAtomicUsizeCounter> Sync for AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    T: Send,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{}
 
-impl<T> AreaInner<T> {
-    /// Create a new AreaInner with the given buffer capacity and reader capacity
-    fn new(buffer_capacity: usize, reader_capacity: usize) -> NonNull<Self> {
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<T> AreaInner<
+    T,
+    BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+    BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
+    BoxedStorage<AtomicUsize>
+> {
+    /// Create a new AreaInner with the given buffer capacity and reader capacity in newly allocated Boxed storage.
+    fn new(buffer_capacity: usize, reader_capacity: usize) -> BoxedStorage<Self> {
         assert!(buffer_capacity > 0, "buffer_capacity must be > 0");
         assert!(
             reader_capacity.is_power_of_two(),
@@ -170,15 +193,13 @@ impl<T> AreaInner<T> {
         );
         assert!(reader_capacity > 0, "reader_capacity must be > 0");
 
-        let mut buffer_vec = Vec::with_capacity(buffer_capacity);
-        for _ in 0..buffer_capacity {
-            buffer_vec.push(UnsafeCell::new(MaybeUninit::uninit()));
-        }
+        let buffer = BoxedSliceStorage::with_capacity_and_init(buffer_capacity, || UnsafeCell::new(MaybeUninit::uninit()));
 
         // Allocate and leak the destruction coordination atomics
-        let destroy_stages = Box::leak(Box::new(AtomicUsize::new(2)));
-        let reader_keep_alloc_tickets = Box::leak(Box::new(AtomicUsize::new(0)));
-        let reader_stage_tickets = Box::leak(Box::new(AtomicUsize::new(0)));
+
+        let destroy_stages = BoxedStorage::new(AtomicUsize::new(2));
+        let reader_keep_alloc_tickets = BoxedStorage::new(AtomicUsize::new(0));
+        let reader_stage_tickets = BoxedStorage::new(AtomicUsize::new(0));
 
         let inner = Self {
             write_gen: CachePadded::new(AtomicU64::new(0)),
@@ -190,28 +211,64 @@ impl<T> AreaInner<T> {
                 CachePadded::new(AtomicU64::new(SUSPENDED_BIT))
             }),
             buffer_capacity,
-            buffer: buffer_vec.into_boxed_slice(),
-            destroy_stages: NonNull::from(destroy_stages),
-            reader_keep_alloc_tickets: NonNull::from(reader_keep_alloc_tickets),
-            reader_stage_tickets: NonNull::from(reader_stage_tickets),
+            buffer,
+            destroy_stages,
+            reader_keep_alloc_tickets,
+            reader_stage_tickets,
+            phantom: PhantomData,
         };
 
-        // Leak the AreaInner and return a NonNull pointer
-        NonNull::from(Box::leak(Box::new(inner)))
+        // Leak the AreaInner and return a BoxedStorage pointer
+        BoxedStorage::new(inner)
+    }
+}
+
+impl<T, SReaderGens, SBuf, SAtomicUsizeCounter> AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
+where
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
+    /// Initialize a new [`AreaInner`] in existing storage.
+    /// 
+    /// # Notes
+    /// - `reader_gens` must have all values initialized not to zero but to `SUSPENDED_BIT`.
+    pub fn init(
+        area_inner: *mut Self,
+        reader_gens: SimpleLPHashMap<CachePadded<AtomicU64>, SReaderGens>,
+        buffer: SBuf,
+        destroy_stages: SAtomicUsizeCounter,
+        reader_keep_alloc_tickets: SAtomicUsizeCounter,
+        reader_stage_tickets: SAtomicUsizeCounter,
+    ) {
+        unsafe {
+            (&raw mut (*area_inner).write_gen).write(CachePadded::new(AtomicU64::new(0)));
+            (&raw mut (*area_inner).read_gen).write(CachePadded::new(AtomicU64::new(0)));
+            (&raw mut (*area_inner).last_valid_gen).write(CachePadded::new(AtomicU64::new(0)));
+            (&raw mut (*area_inner).free_gen).write(CachePadded::new(AtomicU64::new(0)));
+            (&raw mut (*area_inner).writers_count).write(CachePadded::new(AtomicUsize::new(0)));
+            (&raw mut (*area_inner).reader_gens).write(reader_gens);
+            (&raw mut (*area_inner).buffer_capacity).write(buffer.capacity());
+            (&raw mut (*area_inner).buffer).write(buffer);
+            (&raw mut (*area_inner).destroy_stages).write(destroy_stages);
+            (&raw mut (*area_inner).reader_keep_alloc_tickets).write(reader_keep_alloc_tickets);
+            (&raw mut (*area_inner).reader_stage_tickets).write(reader_stage_tickets);
+            // (&raw mut (*area_inner).phantom).write(PhantomData);
+        }
     }
 
     /// Get a mutable pointer to the slot at the given generation number
     #[inline]
     unsafe fn get_slot_ptr_mut(&self, generation: u64) -> *mut T {
         let index = (generation as usize) % self.buffer_capacity;
-        unsafe { (*self.buffer[index].get()).as_mut_ptr() }
+        unsafe { (*self.buffer.slice()[index].get()).as_mut_ptr() }
     }
 
     /// Get a const pointer to the slot at the given generation number
     #[inline]
     unsafe fn get_slot_ptr_const(&self, generation: u64) -> *const T {
         let index = (generation as usize) % self.buffer_capacity;
-        unsafe { (*self.buffer[index].get()).as_ptr() }
+        unsafe { (*self.buffer.slice()[index].get()).as_ptr() }
     }
 
     /// Load the current write generation (non-inclusive)
@@ -707,21 +764,48 @@ impl<T> AreaInner<T> {
 
 /// A writer handle for an Area
 #[derive(Debug)]
-pub struct AreaWriter<T> {
-    inner: NonNull<AreaInner<T>>,
+pub struct AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
+    inner: Area,
+    phantom: PhantomData<(T, SReaderGens, SBuf, SAtomicUsizeCounter)>,
 }
 
-unsafe impl<T: Send> Send for AreaWriter<T> {}
-unsafe impl<T: Send> Sync for AreaWriter<T> {}
+unsafe impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Send for AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    T: Send,
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{}
+unsafe impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Sync for AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    T: Send,
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{}
 
-impl<T> AreaWriter<T> {
+impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Copy + Clone,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     /// Create a new writer handle for the same area
     #[inline]
     pub fn create_writer(&self) -> Self {
         unsafe {
             let inner = self.inner.as_ref();
             inner.writers_count.fetch_add(1, Ordering::AcqRel);
-            AreaWriter { inner: self.inner }
+            AreaWriter { inner: self.inner, phantom: PhantomData }
         }
     }
 }
@@ -760,7 +844,13 @@ pub trait AreaWriterTrait<T> {
 macro_rules! impl_writer_functionality {
     ( $($name:ident),* ) => { // Matches one or more identifiers separated by commas
         $( // Starts a repetition for each identifier captured by `$name`
-            impl<T> AreaWriterTrait<T> for $name<T> {
+            impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaWriterTrait<T> for $name<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+            where 
+                Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+                SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+                SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+                SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+            {
                 /// Try to reserve n slots for writing.
                 /// Returns (start_generation, end_generation) on success.
                 /// end_generation is exclusive (so the range is [start_generation, end_generation)).
@@ -807,7 +897,13 @@ macro_rules! impl_writer_functionality {
                 }
             }
 
-            impl<T> $name<T> {
+            impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> $name<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+            where 
+                Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Copy + Clone,
+                SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+                SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+                SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+            {
                 /// Create a reservation for n slots.
                 /// Returns a RAII guard that must be published.
                 pub fn reserve(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
@@ -836,7 +932,13 @@ macro_rules! impl_writer_functionality {
                 }
             }
 
-            impl<T> $name<T> {
+            impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> $name<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+            where 
+                Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+                SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+                SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+                SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+            {
                 /// Get the number of active writers
                 pub fn get_writers_count(&self) -> usize {
                     unsafe { self.inner.as_ref().load_writers_count() }
@@ -848,7 +950,13 @@ macro_rules! impl_writer_functionality {
 
 impl_writer_functionality!(AreaWriter, AreaReader);
 
-impl<T> AreaWriter<T> {
+impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     /// Try to cleanup old slots by advancing last_valid_gen
     #[inline]
     pub fn try_cleanup_old_slots(&self) -> Result<CleanupResult, CleanupError> {
@@ -856,7 +964,13 @@ impl<T> AreaWriter<T> {
     }
 }
 
-impl<T> Drop for AreaWriter<T> {
+impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Drop for AreaWriter<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     fn drop(&mut self) {
         unsafe {
             let inner = self.inner.as_ref();
@@ -874,15 +988,16 @@ impl<T> Drop for AreaWriter<T> {
                     // Drop all remaining items in the buffer
                     let _ = inner.try_cleanup_old_slots();
 
-                    // Free the AreaInner
-                    let inner_box = Box::from_raw(self.inner.as_ptr());
-
                     // Free the leaked atomics
-                    let _ = Box::from_raw(inner_box.destroy_stages.as_ptr());
-                    let _ = Box::from_raw(inner_box.reader_keep_alloc_tickets.as_ptr());
-                    let _ = Box::from_raw(inner_box.reader_stage_tickets.as_ptr());
+                    self.inner.as_ref().destroy_stages.deallocate();
+                    self.inner.as_ref().reader_keep_alloc_tickets.deallocate();
+                    self.inner.as_ref().reader_stage_tickets.deallocate();
 
-                    // inner_box is dropped here, freeing AreaInner
+                    // Free the buffer
+                    self.inner.as_ref().buffer.deallocate();
+
+                    // Free the AreaInner
+                    self.inner.deallocate();
                 }
             }
         }
@@ -1013,15 +1128,40 @@ where
 }
 
 /// A reader handle for an Area
-pub struct AreaReader<T> {
-    inner: NonNull<AreaInner<T>>,
+pub struct AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
+    inner: Area,
     reader_id: u64,
+    phantom: PhantomData<(T, SReaderGens, SBuf, SAtomicUsizeCounter)>,
 }
 
-unsafe impl<T: Send> Send for AreaReader<T> {}
-unsafe impl<T: Send> Sync for AreaReader<T> {}
+unsafe impl<T: Send, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Send for AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> 
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{}
+unsafe impl<T: Send, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Sync for AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> 
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{}
 
-impl<T> AreaReader<T> {
+impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Copy + Clone,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     /// Create a new reader handle for the same area
     #[cfg(feature = "std")]
     pub fn create_reader(&self) -> Result<Self, RegisterError> {
@@ -1031,6 +1171,7 @@ impl<T> AreaReader<T> {
             Ok(AreaReader {
                 inner: self.inner,
                 reader_id,
+                phantom: PhantomData,
             })
         }
     }
@@ -1047,10 +1188,19 @@ impl<T> AreaReader<T> {
             Ok(AreaReader {
                 inner: self.inner,
                 reader_id,
+                phantom: PhantomData,
             })
         }
     }
+}
 
+impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     /// Get the current generation number for this reader
     pub fn get_gen(&self) -> u64 {
         unsafe {
@@ -1113,7 +1263,13 @@ impl<T> AreaReader<T> {
     }
 }
 
-impl<T> Drop for AreaReader<T> {
+impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Drop for AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     fn drop(&mut self) {
         unsafe {
             let inner = self.inner.as_ref();
@@ -1166,37 +1322,49 @@ impl<T> Drop for AreaReader<T> {
                     // Drop all remaining items in the buffer
                     let _ = inner.try_cleanup_old_slots();
 
-                    // Free the AreaInner
-                    let inner_box = Box::from_raw(self.inner.as_ptr());
-
                     // Free the leaked atomics
-                    let _ = Box::from_raw(inner_box.destroy_stages.as_ptr());
-                    let _ = Box::from_raw(inner_box.reader_keep_alloc_tickets.as_ptr());
-                    let _ = Box::from_raw(inner_box.reader_stage_tickets.as_ptr());
+                    self.inner.as_ref().destroy_stages.deallocate();
+                    self.inner.as_ref().reader_keep_alloc_tickets.deallocate();
+                    self.inner.as_ref().reader_stage_tickets.deallocate();
 
-                    // inner_box is dropped here, freeing AreaInner
-                }
+                    // Free the buffer
+                    self.inner.as_ref().buffer.deallocate();
+
+                    // Free the AreaInner
+                    self.inner.deallocate();                }
             }
         }
     }
 }
 
 /// A slice-like view of readable messages that auto-advances on drop
-pub struct ReadSlice<'a, T> {
-    reader: &'a mut AreaReader<T>,
+pub struct ReadSlice<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
+    reader: &'a mut AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>,
     start_gen: u64,
     end_gen: u64,
     armed: bool,
 }
 
-impl<'a, T> ReadSlice<'a, T> {
+impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> ReadSlice<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     /// Create a new ReadSlice that is disarmed by default (won't auto-advance on drop).
     /// Caller must manually advance.
     ///
     /// # Safety
     /// - start_gen and end_gen must be valid generation numbers
     pub unsafe fn new_disarmed(
-        reader: &'a mut AreaReader<T>,
+        reader: &'a mut AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>,
         start_gen: u64,
         end_gen: u64,
     ) -> Self {
@@ -1221,7 +1389,7 @@ impl<'a, T> ReadSlice<'a, T> {
     ///
     /// # Safety
     /// - The caller must ensure the reader is advanced appropriately
-    pub unsafe fn into_raw_parts(self) -> (&'a mut AreaReader<T>, u64, u64, bool) {
+    pub unsafe fn into_raw_parts(self) -> (&'a mut AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>, u64, u64, bool) {
         let manually_dropped_s = core::mem::ManuallyDrop::new(self);
 
         let reader;
@@ -1261,7 +1429,7 @@ impl<'a, T> ReadSlice<'a, T> {
     }
 
     /// Iterate over all messages in the slice
-    pub fn iter(&self) -> ReadSliceIter<'_, T> {
+    pub fn iter(&self) -> ReadSliceIter<'_, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> {
         ReadSliceIter {
             slice: self,
             current: 0,
@@ -1281,7 +1449,7 @@ impl<'a, T> ReadSlice<'a, T> {
         let len = (self.end_gen - self.start_gen) as usize;
 
         unsafe {
-            let buffer_ptr = self.reader.inner.as_ref().buffer.as_ptr() as *const T;
+            let buffer_ptr = self.reader.inner.as_ref().buffer.as_ptr().as_ptr() as *const T;
 
             if start_idx + len <= cap {
                 // Contiguous
@@ -1305,7 +1473,13 @@ impl<'a, T> ReadSlice<'a, T> {
     }
 }
 
-impl<'a, T> Drop for ReadSlice<'a, T> {
+impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Drop for ReadSlice<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     fn drop(&mut self) {
         if !self.armed {
             // Slice was disarmed, don't auto-advance
@@ -1330,10 +1504,16 @@ impl<'a, T> Drop for ReadSlice<'a, T> {
     }
 }
 
-impl<T> AreaReader<T> {
+impl<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> AreaReader<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     /// Get a slice of all currently available messages.
     /// When the slice is dropped, the reader automatically advances past these messages.
-    pub fn read(&mut self) -> ReadSlice<'_, T> {
+    pub fn read(&mut self) -> ReadSlice<'_, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> {
         let start_generation = gen_without_suspended_bit(self.get_gen());
         let end_generation = self.load_read_gen();
         ReadSlice {
@@ -1352,7 +1532,7 @@ impl<T> AreaReader<T> {
     /// # Behavior to note
     /// 
     /// This method only checks for **AreaWriters,** not other AreaReaders. If you are primarily using the readers-are-also-writers pattern, use [`AreaReader::read`] instead and implement your own check for exit conditions.
-    pub fn read_with_check(&mut self) -> Result<ReadSlice<'_, T>, ReadError> {
+    pub fn read_with_check(&mut self) -> Result<ReadSlice<'_, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>, ReadError> {
         let (returned_self, start_gen, _, _) = {
             let result = self.read();
 
@@ -1384,12 +1564,24 @@ impl<T> AreaReader<T> {
 }
 
 /// Iterator over messages in a ReadSlice
-pub struct ReadSliceIter<'a, T> {
-    slice: &'a ReadSlice<'a, T>,
+pub struct ReadSliceIter<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
+    slice: &'a ReadSlice<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>,
     current: usize,
 }
 
-impl<'a, T> Iterator for ReadSliceIter<'a, T> {
+impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> Iterator for ReadSliceIter<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1404,51 +1596,44 @@ impl<'a, T> Iterator for ReadSliceIter<'a, T> {
     }
 }
 
-impl<'a, T> ExactSizeIterator for ReadSliceIter<'a, T> {}
-
-/// Builder for creating an Area
-pub struct AreaBuilder {
-    buffer_capacity: usize,
-    reader_capacity: usize,
-}
-
-impl AreaBuilder {
-    /// Create a new builder with default settings
-    pub fn new() -> Self {
-        Self {
-            buffer_capacity: 1024,
-            reader_capacity: 128,
-        }
-    }
-
-    /// Set the ring buffer capacity (must be > 0)
-    pub fn buffer_capacity(mut self, capacity: usize) -> Self {
-        self.buffer_capacity = capacity;
-        self
-    }
-
-    /// Set the maximum number of readers (must be a power of two)
-    pub fn reader_capacity(mut self, capacity: usize) -> Self {
-        self.reader_capacity = capacity;
-        self
-    }
-
-    /// Build the Area, returning a writer and a reader handle
-    pub fn build<T>(self) -> (AreaWriter<T>, AreaReader<T>) {
-        area(self.buffer_capacity, self.reader_capacity)
-    }
-}
-
-impl Default for AreaBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+impl<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> ExactSizeIterator for ReadSliceIter<'a, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>>,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{}
 
 /// Create a new area with the given buffer and reader capacity.
 /// Returns a writer and a reader handle.
 /// Panics if initial reader registration fails (e.g. capacity reached).
-pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (AreaWriter<T>, AreaReader<T>) {
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (
+    AreaWriter<
+        T,
+        BoxedStorage<AreaInner<
+            T,
+            BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+            BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
+            BoxedStorage<AtomicUsize>,
+        >>,
+        BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+        BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
+        BoxedStorage<AtomicUsize>
+    >,
+    AreaReader<
+        T,
+        BoxedStorage<AreaInner<
+            T,
+            BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+            BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
+            BoxedStorage<AtomicUsize>,
+        >>,
+        BoxedSliceStorage<Slot<CachePadded<AtomicU64>>>,
+        BoxedSliceStorage<UnsafeCell<MaybeUninit<T>>>,
+        BoxedStorage<AtomicUsize>
+    >
+) {
     let inner = AreaInner::new(buffer_capacity, reader_capacity);
 
     unsafe {
@@ -1464,14 +1649,57 @@ pub fn area<T>(buffer_capacity: usize, reader_capacity: usize) -> (AreaWriter<T>
             }
         };
 
-        let writer = AreaWriter { inner };
-        let reader = AreaReader { inner, reader_id };
+        let writer = AreaWriter { inner, phantom: PhantomData };
+        let reader = AreaReader { inner, reader_id, phantom: PhantomData };
+
+        (writer, reader)
+    }
+}
+
+pub fn finish_init<T, Area, SReaderGens, SBuf, SAtomicUsizeCounter>(inner: Area) -> (
+    AreaWriter<
+        T,
+        Area,
+        SReaderGens,
+        SBuf,
+        SAtomicUsizeCounter,
+    >,
+    AreaReader<
+        T,
+        Area,
+        SReaderGens,
+        SBuf,
+        SAtomicUsizeCounter,
+    >
+) 
+where 
+    Area: FixedStorage<AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>> + Clone,
+    SReaderGens: FixedStorage<Slot<CachePadded<AtomicU64>>> + FixedStorageMultiple<Slot<CachePadded<AtomicU64>>>,
+    SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
+    SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
+{
+    unsafe {
+        let inner_ref = inner.as_ref();
+        // Set initial writers count
+        inner_ref.writers_count.store(1, Ordering::Release);
+
+        // Register the initial reader
+        let reader_id = match inner_ref.register_reader_with_seed(1) {
+            Ok(id) => id,
+            Err(RegisterError::ReaderCapacityReached) => {
+                panic!("Initial reader registration failed: capacity reached")
+            }
+        };
+
+        let writer = AreaWriter { inner: inner.clone(), phantom: PhantomData };
+        let reader = AreaReader { inner, reader_id, phantom: PhantomData };
 
         (writer, reader)
     }
 }
 
 #[cfg(test)]
+#[cfg(any(feature = "std", feature = "alloc"))]
 mod tests {
     use super::*;
 
@@ -1485,10 +1713,7 @@ mod tests {
 
     #[test]
     fn test_basic_writer_reserve_and_publish() {
-        let (writer, reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, reader) = area::<u64>(16, 8);
 
         // Initial state
         assert_eq!(reader.get_gen(), 0);
@@ -1517,10 +1742,7 @@ mod tests {
 
     #[test]
     fn test_reservation_write_and_publish() {
-        let (writer, _reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, _reader) = area::<u64>(16, 8);
 
         // Reserve 4 slots
         let mut reservation = writer.reserve(4).unwrap();
@@ -1535,10 +1757,7 @@ mod tests {
 
     #[test]
     fn test_reservation_split() {
-        let (writer, _reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, _reader) = area::<u64>(16, 8);
 
         // Reserve 4 slots
         let reservation = writer.reserve(4).unwrap();
@@ -1568,10 +1787,7 @@ mod tests {
 
     #[test]
     fn test_reservation_raii() {
-        let (writer, reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, reader) = area::<u64>(16, 8);
 
         // Use reservation
         let mut reservation = writer.reserve(4).expect("Failed to reserve");
@@ -1607,10 +1823,7 @@ mod tests {
             }
         }
 
-        let (writer, mut reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<ComplexStruct>();
+        let (writer, mut reader) = area::<ComplexStruct>(16, 8);
 
         let mut reservation = writer.reserve(1).unwrap();
         let slot = reservation.get_mut(0).unwrap();
@@ -1642,10 +1855,7 @@ mod tests {
 
     #[test]
     fn test_reader_registration_and_reading() {
-        let (writer, reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, reader) = area::<u64>(16, 8);
 
         // Write some messages
         let (start, end) = writer.try_reserve_slots(3).expect("Failed to reserve");
@@ -1676,10 +1886,7 @@ mod tests {
 
     #[test]
     fn test_register_capacity_reached() {
-        let (_writer, reader1) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(2) // Small capacity
-            .build::<u64>();
+        let (_writer, reader1) = area::<u64>(16, 2); // Small capacity
 
         // Capacity is 2. reader1 takes one slot.
 
@@ -1694,10 +1901,7 @@ mod tests {
 
     #[test]
     fn test_create_writer() {
-        let (writer1, _reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer1, _reader) = area::<u64>(16, 8);
         let writer2 = writer1.create_writer();
 
         // Both writers should work
@@ -1713,10 +1917,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn test_create_reader() {
-        let (writer, reader1) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, reader1) = area::<u64>(16, 8);
         let reader2 = reader1.create_reader().expect("Failed to create reader");
 
         // Different reader IDs
@@ -1740,10 +1941,7 @@ mod tests {
 
     #[test]
     fn test_reserve_overflow() {
-        let (writer, _reader) = AreaBuilder::new()
-            .buffer_capacity(4)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, _reader) = area::<u64>(4, 8);
 
         // Fill the buffer
         let (start1, end1) = writer.try_reserve_slots(4).expect("Failed to reserve");
@@ -1757,10 +1955,7 @@ mod tests {
 
     #[test]
     fn test_best_effort_reserve() {
-        let (writer, _reader) = AreaBuilder::new()
-            .buffer_capacity(4)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, _reader) = area::<u64>(4, 8);
 
         // Reserve 2 slots normally
         let (start1, end1) = writer.try_reserve_slots(2).expect("Failed to reserve");
@@ -1789,10 +1984,7 @@ mod tests {
 
     #[test]
     fn test_suspend_and_resume() {
-        let (_writer, mut reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (_writer, mut reader) = area::<u64>(16, 8);
 
         // Suspend the reader
         assert!(reader.suspend().is_ok());
@@ -1827,10 +2019,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_simple() {
-        let (writer, mut reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, mut reader) = area::<u64>(16, 8);
 
         // Write some messages
         let (start, end) = writer.try_reserve_slots(5).expect("Failed to reserve");
@@ -1857,10 +2046,7 @@ mod tests {
 
     #[test]
     fn test_unregister_unblocks_writer() {
-        let (writer, reader) = AreaBuilder::new()
-            .buffer_capacity(4)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, reader) = area::<u64>(4, 8);
 
         // Reader stays at 0
 
@@ -1888,10 +2074,7 @@ mod tests {
 
     #[test]
     fn test_writer_drop_decrements_count() {
-        let (writer1, _reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer1, _reader) = area::<u64>(16, 8);
 
         unsafe {
             let count_before = writer1.inner.as_ref().writers_count.load(Ordering::Acquire);
@@ -1915,10 +2098,7 @@ mod tests {
 
     #[test]
     fn test_suspend_idempotent() {
-        let (_writer, mut reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (_writer, mut reader) = area::<u64>(16, 8);
 
         assert!(reader.suspend().is_ok());
         assert!(is_suspended(reader.get_gen()));
@@ -1934,10 +2114,7 @@ mod tests {
 
     #[test]
     fn test_advance_while_suspended_fails() {
-        let (_writer, mut reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (_writer, mut reader) = area::<u64>(16, 8);
 
         assert!(reader.suspend().is_ok());
 
@@ -1948,10 +2125,7 @@ mod tests {
 
     #[test]
     fn test_publish_cas_failure() {
-        let (writer1, _reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer1, _reader) = area::<u64>(16, 8);
         let writer2 = writer1.create_writer();
 
         // Writer1 reserves slots 0-2
@@ -1996,10 +2170,7 @@ mod tests {
         // This test verifies that dropping all handles properly cleans up
         // We can't directly observe the cleanup, but we can ensure it doesn't panic
         {
-            let (writer, reader) = AreaBuilder::new()
-                .buffer_capacity(16)
-                .reader_capacity(8)
-                .build::<u64>();
+            let (writer, reader) = area::<u64>(16, 8);
             let _writer2 = writer.create_writer();
             let _reader2 = reader.create_reader_with_seed(100).expect("Failed to create reader");
 
@@ -2020,10 +2191,7 @@ mod tests {
 
     #[test]
     fn test_read_slice() {
-        let (writer, mut reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, mut reader) = area::<u64>(16, 8);
 
         // Write some messages
         let (start, end) = writer.try_reserve_slots(5).expect("Failed to reserve");
@@ -2089,10 +2257,7 @@ mod tests {
 
     #[test]
     fn test_register_reader_respects_cleanup() {
-        let (writer, mut reader1) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(8)
-            .build::<u64>();
+        let (writer, mut reader1) = area::<u64>(16, 8);
 
         // Advance everything to generation 10
         let (start, end) = writer.try_reserve_slots(10).unwrap();
@@ -2119,9 +2284,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "reader_capacity must be a power of two")]
     fn test_area_creation_panics_on_invalid_capacity() {
-        let (_writer, _reader) = AreaBuilder::new()
-            .buffer_capacity(16)
-            .reader_capacity(0)
-            .build::<u64>();
+        let (_writer, _reader) = area::<u64>(16, 0);
     }
 }

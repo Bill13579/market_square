@@ -4,13 +4,11 @@ use core::{
     ptr,
     sync::atomic::{AtomicU64, Ordering},
 };
-#[cfg(all(feature = "alloc", not(feature = "std")))]
-extern crate alloc;
-#[cfg(feature = "std")]
-extern crate std as alloc;
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+use crate::storage::{FixedStorage, FixedStorageMultiple};
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+use crate::storage::BoxedSliceStorage;
 
 pub const EMPTY: u64 = 0;
 pub const IN_PROGRESS: u64 = 1 << 63;
@@ -36,9 +34,13 @@ pub fn is_in_progress(k: u64) -> bool {
     (k & IN_PROGRESS) != 0 && k != EMPTY
 }
 
-pub struct SimpleLPHashMap<V> {
+pub struct SimpleLPHashMap<V, S>
+where 
+    S: FixedStorage<Slot<V>> + FixedStorageMultiple<Slot<V>>
+{
     mask: usize,
-    slots: Box<[Slot<V>]>,
+    slots: S,
+    phantom: core::marker::PhantomData<V>,
 }
 
 pub struct Slot<V> {
@@ -47,7 +49,7 @@ pub struct Slot<V> {
 }
 
 impl<V> Slot<V> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             key: AtomicU64::new(EMPTY),
             value: UnsafeCell::new(MaybeUninit::uninit()),
@@ -61,18 +63,43 @@ impl<V> Slot<V> {
 }
 
 // We allow cross-thread use, but correctness when using the unsafe API is on the caller.
-unsafe impl<V: Send + Sync> Sync for SimpleLPHashMap<V> {}
-unsafe impl<V: Send> Send for SimpleLPHashMap<V> {}
+unsafe impl<V: Send + Sync, S: FixedStorage<Slot<V>> + FixedStorageMultiple<Slot<V>>> Sync for SimpleLPHashMap<V, S> {}
+unsafe impl<V: Send, S: FixedStorage<Slot<V>> + FixedStorageMultiple<Slot<V>>> Send for SimpleLPHashMap<V, S> {}
 
-impl<V> SimpleLPHashMap<V> {
-    /// Capacity must be a power of two.
-    pub fn with_capacity(capacity: usize) -> Self {
+impl<V, S> SimpleLPHashMap<V, S>
+where 
+    S: FixedStorage<Slot<V>> + FixedStorageMultiple<Slot<V>>
+{
+    /// Create from pre-existing storage.
+    /// 
+    /// # Safety
+    /// - Storage must be initialized with valid `Slot<V>` values
+    /// - Capacity must be a power of two
+    pub unsafe fn from_storage(storage: S) -> Self {
+        let capacity = storage.capacity();
         assert!(capacity.is_power_of_two() && capacity > 0);
-        let mut v = Vec::with_capacity(capacity);
-        v.resize_with(capacity, Slot::new);
         Self {
             mask: capacity - 1,
-            slots: v.into_boxed_slice(),
+            slots: storage,
+            phantom: core::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    fn slots(&self) -> &[Slot<V>] {
+        self.slots.slice()
+    }
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<V> SimpleLPHashMap<V, BoxedSliceStorage<Slot<V>>> {
+    /// Create a new map with Vec-backing and the given capacity. Capacity must be a power of two.
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity.is_power_of_two() && capacity > 0);
+        Self {
+            mask: capacity - 1,
+            slots: BoxedSliceStorage::with_capacity_and_init(capacity, Slot::new),
+            phantom: core::marker::PhantomData,
         }
     }
 
@@ -83,22 +110,23 @@ impl<V> SimpleLPHashMap<V> {
     where
         F: FnMut() -> V,
     {
-        assert!(capacity.is_power_of_two() && capacity > 0);
-        let mut v = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            v.push(Slot {
-                key: AtomicU64::new(EMPTY),
-                value: UnsafeCell::new(MaybeUninit::new(init_value())),
-            });
-        }
+        // Not 'assert!' since `area.rs` already checks this.
+        debug_assert!(capacity.is_power_of_two() && capacity > 0);
         Self {
             mask: capacity - 1,
-            slots: v.into_boxed_slice(),
+            slots: BoxedSliceStorage::with_capacity_and_init(capacity, || Slot {
+                key: AtomicU64::new(EMPTY),
+                value: UnsafeCell::new(MaybeUninit::new(init_value())),
+            }),
+            phantom: core::marker::PhantomData,
         }
     }
 }
 
-impl<V> SimpleLPHashMap<V> {
+impl<V, S> SimpleLPHashMap<V, S>
+where 
+    S: FixedStorage<Slot<V>> + FixedStorageMultiple<Slot<V>>
+{
     /// Get the capacity of the map
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -112,7 +140,7 @@ impl<V> SimpleLPHashMap<V> {
     /// - The caller must handle EMPTY keys and IN_PROGRESS state appropriately
     #[inline]
     pub unsafe fn raw_slots(&self) -> &[Slot<V>] {
-        &self.slots
+        &self.slots()
     }
 
     /// Get a const reference to a slot by index
@@ -121,7 +149,7 @@ impl<V> SimpleLPHashMap<V> {
     /// - index must be < capacity
     #[inline]
     pub unsafe fn slot_at(&self, index: usize) -> &Slot<V> {
-        &self.slots[index]
+        &self.slots()[index]
     }
 
     /// Scan all slots and call the visitor function for each non-empty slot.
@@ -134,7 +162,7 @@ impl<V> SimpleLPHashMap<V> {
     where
         F: FnMut(usize, u64, *const V),
     {
-        for (index, slot) in self.slots.iter().enumerate() {
+        for (index, slot) in self.slots().iter().enumerate() {
             let k = slot.load_key();
             if k != EMPTY {
                 let ptr = self.value_ptr(index);
@@ -154,7 +182,7 @@ impl<V> SimpleLPHashMap<V> {
     /// Get a raw pointer to the value at index.
     #[inline]
     fn value_ptr(&self, index: usize) -> *const V {
-        unsafe { (*self.slots[index].value.get()).as_ptr() }
+        unsafe { (*self.slots()[index].value.get()).as_ptr() }
     }
 
     /// Concurrent get-or-insert using CAS on the key.
@@ -197,7 +225,7 @@ impl<V> SimpleLPHashMap<V> {
     /// use market_square::map::{SimpleLPHashMap, key_bits, ZERO_OFFSET, IMMEDIATE};
     /// use std::sync::atomic::{AtomicU64, Ordering};
     ///
-    /// let map = SimpleLPHashMap::<AtomicU64>::with_capacity(16);
+    /// let map = SimpleLPHashMap::<AtomicU64, _>::with_capacity(16);
     /// let seed_key = 12345u64;
     /// let placement_offset = ZERO_OFFSET;
     /// let n = 16;
@@ -246,7 +274,7 @@ impl<V> SimpleLPHashMap<V> {
         }
 
         for i in 0..n {
-            let k = self.slots[idx].load_key();
+            let k = self.slots()[idx].load_key();
 
             if insert && k == EMPTY {
                 let expected = k;
@@ -260,7 +288,7 @@ impl<V> SimpleLPHashMap<V> {
                     }
                     logical_key | IN_PROGRESS
                 };
-                match self.slots[idx].key.compare_exchange(
+                match self.slots()[idx].key.compare_exchange(
                     expected,
                     new_key,
                     Ordering::AcqRel,
@@ -281,7 +309,7 @@ impl<V> SimpleLPHashMap<V> {
                 }
             }
 
-            if key_bits(k) == key {
+            if !fold && key_bits(k) == key {
                 // Found existing key.
                 let ptr = self.value_ptr(idx);
                 return (ptr, false, i, k, idx);
@@ -301,7 +329,7 @@ impl<V> SimpleLPHashMap<V> {
     ///   returned from `get_or_insert_concurrent`.
     /// - The value at that slot must be fully initialized before calling this.
     pub unsafe fn finish_init_at(&self, index: usize) {
-        let slot = &self.slots[index];
+        let slot = &self.slots()[index];
         let k = slot.key.load(Ordering::Acquire);
         debug_assert!(k != EMPTY);
         if is_in_progress(k) {
@@ -327,10 +355,10 @@ impl<V> SimpleLPHashMap<V> {
         }
 
         for _ in 0..n {
-            let k = self.slots[idx].load_key();
+            let k = self.slots()[idx].load_key();
             
             if key_bits(k) == key {
-                if self.slots[idx].key.compare_exchange(
+                if self.slots()[idx].key.compare_exchange(
                     k,
                     EMPTY,
                     Ordering::AcqRel,
@@ -347,5 +375,16 @@ impl<V> SimpleLPHashMap<V> {
         }
 
         false
+    }
+}
+
+impl<V, S> Drop for SimpleLPHashMap<V, S>
+where 
+    S: FixedStorage<Slot<V>> + FixedStorageMultiple<Slot<V>>
+{
+    fn drop(&mut self) {
+        unsafe {
+            self.slots.deallocate();
+        }
     }
 }

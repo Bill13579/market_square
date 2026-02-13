@@ -1,6 +1,6 @@
 [package]
 name = "market_square"
-version = "0.1.3"
+version = "0.2.0-alpha.1"
 edition = "2024"
 description = "A lock-free mpmc \"square\""
 homepage = "https://github.com/Bill13579/market_square"
@@ -8,16 +8,15 @@ repository = "https://github.com/Bill13579/market_square"
 documentation = "https://docs.rs/market_square"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-keywords = ["channel", "mpmc", "broadcast", "lock-free", "no_std"]
+keywords = ["mpmc", "broadcast", "lock-free", "no_std", "no_alloc"]
 categories = ["algorithms", "concurrency", "data-structures"]
 
 [features]
 default = ["std"]           # std is enabled by default
-std = ["dep:rand"]   # marker feature for std
-alloc = []                  # marker feature for alloc; added for future use, but for now, alloc is always required when std is disabled
+std = ["dep:rand"]          # marker feature for std
+alloc = []                  # marker feature for alloc
 
 [dependencies]
-crossbeam-utils = { version = "0.8", default-features = false }
 rand = { version = "0.9", optional = true, default-features = false, features = ["thread_rng"] }
 
 [dev-dependencies]

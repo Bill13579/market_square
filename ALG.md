@@ -169,5 +169,5 @@ An important consideration here is that for this design, we must only allow read
 - `get_or_insert_concurrent` simply gets or inserts slots, not values. Using the provided key, it indexes into the map and sees if the key is taken. If it is not, the slot is returned. If it is, it begins iterating from that index, up to `n` iterations. This iteration process is what gives meaning to the `placement_offset` value; conceptually, each element in this map is keyed not by just the provided key, but by a `(key, placement_offset)`.
 - `fold` then "folds" the `placement_offset` into the key, giving `(key + placement_offset, 0)`. This is important since the two keys are not equivalent; inserting a value with key `(key, placement_offset)`, you will not be able to retrieve the slot later via `(key + placement_offset, 0)`.
 - Capturing slots is done via one CAS instruction upon the atomic key.
-- When a slot is first obtained, the `IN_PROGRESS` flag is set to zero.
-- `finish_init_at` flips this flag to one. This is the only synchronization feature provided for the values of the map.
+- When a slot is first obtained, the `IN_PROGRESS` flag is set to one.
+- `finish_init_at` clears this flag. This is the only synchronization feature provided for the values of the map.
