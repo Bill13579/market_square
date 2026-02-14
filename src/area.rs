@@ -345,7 +345,7 @@ where
 
     /// Try to reserve up to n slots, getting as many as possible, using CAS.
     /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
-    /// Never returns NoSpace - gets 0 slots if none available.
+    /// Never returns `NoSpace`, since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
     fn try_reserve_slots_best_effort(&self, n: usize) -> Result<(NumericType, NumericType, usize), ReserveError> {
         if n == 0 {
             return Ok((0, 0, 0));
@@ -374,6 +374,58 @@ where
             Ok(_) => Ok((current_write, expected_new_write, actual_n as usize)),
             Err(_) => Err(ReserveError::FailedGrab),
         }
+    }
+
+    /// Try to reserve n slots for writing **assuming this writer is the only one ever writing!**
+    /// Returns (start_generation, end_generation) on success.
+    /// end_generation is exclusive (so the range is [start_generation, end_generation))
+    fn try_reserve_slots_ex(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
+        debug_assert!(n != 0, "must reserve at least one slot");
+
+        // Load current state
+        let current_free = self.load_free_gen();
+        let current_write = self.load_write_gen(); //NOTE: Must come AFTER loading current_free to be conservative about free spots being available.
+        debug_assert!(gen_lte_msb_masked(current_free, current_write), "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
+        let available = self.buffer_capacity as NumericType - (self.buffer_capacity as NumericType).min(gen_dist_msb_masked(current_write, current_free)); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
+
+        // Check if there's enough capacity
+        if (n as NumericType) > available {
+            return Err(ReserveError::NoSpace);
+        }
+
+        // Update write_gen from current_write to current_write + n
+        let new_write_gen = gen_add_msb_masked(current_write, n as NumericType);
+        // See "Important Note" from try_reserve_slots above.
+        self.write_gen.store(new_write_gen, Ordering::Release);
+        
+        Ok((current_write, new_write_gen))
+    }
+
+    /// Try to reserve up to n slots, getting as many as possible, **assuming this writer is the only one ever writing!**
+    /// Returns (start_generation, end_generation, actual_count).
+    /// Never returns an error, since the exclusivity assumption removes any `FailedGrab` scenarios and in the case that no slots are available it simply returns `(0, 0, 0)`.
+    fn try_reserve_slots_ex_best_effort(&self, n: usize) -> (NumericType, NumericType, usize) {
+        if n == 0 {
+            return (0, 0, 0);
+        }
+
+        // Load current state
+        let current_free = self.load_free_gen();
+        let current_write = self.load_write_gen(); //NOTE: Must come AFTER loading current_free to be conservative about free spots being available.
+        debug_assert!(gen_lte_msb_masked(current_free, current_write), "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
+        let available = self.buffer_capacity as NumericType - (self.buffer_capacity as NumericType).min(gen_dist_msb_masked(current_write, current_free)); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
+        let actual_n = (n as NumericType).min(available);
+
+        if actual_n == 0 {
+            return (0, 0, 0);
+        }
+
+        // Update write_gen from current_write to current_write + actual
+        let new_write_gen = gen_add_msb_masked(current_write, actual_n);
+        // See "Important Note" from try_reserve_slots above.
+        self.write_gen.store(new_write_gen, Ordering::Release);
+        
+        (current_write, new_write_gen, actual_n as usize)
     }
 
     /// Publish slots in the range [start_generation, end_generation) for readers.
@@ -850,12 +902,25 @@ pub trait AreaWriterTrait<T> {
 
     /// Try to reserve up to n slots, getting as many as possible.
     /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
-    /// Never returns NoSpace - gets 0 slots if none available.
+    /// Never returns `NoSpace`, since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
     /// end_generation is exclusive (so the range is [start_generation, end_generation)).
     fn try_reserve_slots_best_effort(
         &self,
         n: usize,
     ) -> Result<(NumericType, NumericType, usize), ReserveError>;
+
+    /// Try to reserve n slots for writing **assuming this writer is the only one ever writing!**
+    /// Returns (start_generation, end_generation) on success.
+    /// end_generation is exclusive (so the range is [start_generation, end_generation))
+    fn try_reserve_slots_ex(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError>;
+
+    /// Try to reserve up to n slots, getting as many as possible, **assuming this writer is the only one ever writing!**
+    /// Returns (start_generation, end_generation, actual_count).
+    /// Never returns an error, since the exclusivity assumption removes any `FailedGrab` scenarios and in the case that no slots are available it simply returns `(0, 0, 0)`.
+    fn try_reserve_slots_ex_best_effort(
+        &self,
+        n: usize,
+    ) -> (NumericType, NumericType, usize);
 
     /// Publish slots in the range [start_generation, end_generation) for readers.
     fn publish_slots(
@@ -893,7 +958,7 @@ macro_rules! impl_writer_functionality {
 
                 /// Try to reserve up to n slots, getting as many as possible.
                 /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
-                /// Never returns NoSpace - gets 0 slots if none available.
+                /// Never returns `NoSpace`, since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
                 /// end_generation is exclusive (so the range is [start_generation, end_generation)).
                 #[inline]
                 fn try_reserve_slots_best_effort(
@@ -901,6 +966,25 @@ macro_rules! impl_writer_functionality {
                     n: usize,
                 ) -> Result<(NumericType, NumericType, usize), ReserveError> {
                     unsafe { self.inner.as_ref().try_reserve_slots_best_effort(n) }
+                }
+
+                /// Try to reserve n slots for writing **assuming this writer is the only one ever writing!**
+                /// Returns (start_generation, end_generation) on success.
+                /// end_generation is exclusive (so the range is [start_generation, end_generation))
+                #[inline]
+                fn try_reserve_slots_ex(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
+                    unsafe { self.inner.as_ref().try_reserve_slots_ex(n) }
+                }
+
+                /// Try to reserve up to n slots, getting as many as possible, **assuming this writer is the only one ever writing!**
+                /// Returns (start_generation, end_generation, actual_count).
+                /// Never returns an error, since the exclusivity assumption removes any `FailedGrab` scenarios and in the case that no slots are available it simply returns `(0, 0, 0)`.
+                #[inline]
+                fn try_reserve_slots_ex_best_effort(
+                    &self,
+                    n: usize,
+                ) -> (NumericType, NumericType, usize) {
+                    unsafe { self.inner.as_ref().try_reserve_slots_ex_best_effort(n) }
                 }
 
                 /// Publish slots in the range [start_generation, end_generation) for readers.
@@ -937,7 +1021,7 @@ macro_rules! impl_writer_functionality {
                 SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
             {
                 /// Create a reservation for n slots.
-                /// Returns a RAII guard that must be published.
+                /// Returns an RAII guard that must be published.
                 pub fn reserve(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
                     let (start, end) = self.try_reserve_slots(n)?;
                     Ok(Reservation {
@@ -950,9 +1034,43 @@ macro_rules! impl_writer_functionality {
                 }
 
                 /// Try to reserve up to n slots, getting as many as possible.
-                /// Returns a RAII guard that must be published.
+                /// Returns an RAII guard that must be published.
                 pub fn reserve_best_effort(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
                     let (start, end, count) = self.try_reserve_slots_best_effort(n)?;
+                    debug_assert!(gen_dist_msb_masked(end, start) == count as NumericType);
+                    Ok(Reservation {
+                        writer: self,
+                        start_gen: start,
+                        end_gen: end,
+                        published: false,
+                        phantom: PhantomData,
+                    })
+                }
+
+                /// Create a reservation for n slots **assuming this writer is the only one ever writing!**
+                /// Returns an RAII guard that must be published.
+                /// 
+                /// # Safety
+                /// Can never fail with `FailedGrab` since in the "exclusive" reservation functions we do not use CAS to reserve slots and so they always succeed. For safety however it can only be used if the caller can guarantee that no other writer is concurrently trying to reserve as well.
+                pub fn reserve_ex(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
+                    let (start, end) = self.try_reserve_slots_ex(n)?;
+                    Ok(Reservation {
+                        writer: self,
+                        start_gen: start,
+                        end_gen: end,
+                        published: false,
+                        phantom: PhantomData,
+                    })
+                }
+
+                /// Try to reserve up to n slots and getting as many as possible **assuming this writer is the only one ever writing!**
+                /// Returns an RAII guard that must be published.
+                /// If there are no slots available, this does not return `NoSpace` but instead simply returns an empty [`Reservation`].
+                /// 
+                /// # Safety
+                /// Can never fail, since in the "exclusive" reservation functions we do not use CAS to reserve slots and so they always succeed. For safety however it can only be used if the caller can guarantee that no other writer is concurrently trying to reserve as well.
+                pub fn reserve_ex_best_effort(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
+                    let (start, end, count) = self.try_reserve_slots_ex_best_effort(n);
                     debug_assert!(gen_dist_msb_masked(end, start) == count as NumericType);
                     Ok(Reservation {
                         writer: self,
