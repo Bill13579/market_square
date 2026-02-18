@@ -20,7 +20,7 @@ fn main() {
 
         reader_handles.push(thread::spawn(move || {
             while let Ok(slice) = reader.read_with_check() {
-                let _ = slice.try_cleanup_old_slots(); // Readers calling clean-up tends to work well.
+                let _ = slice.try_cleanup_old_slots::<()>(); // Readers calling clean-up tends to work well.
                 if slice.len() != 0 {
                     println!(
                         "\n[reader {}] got {} messages! {:?}",
@@ -43,7 +43,7 @@ fn main() {
                     // Writers should be careful not to begin cleanup before any readers can join. Here, we just don't clean up from the writer-side.
                     // let _ = writer.try_cleanup_old_slots();
 
-                    match writer.reserve(1) {
+                    match writer.reserve::<()>(1) {
                         Ok(mut reservation) => {
                             reservation.get_mut(0).unwrap().write(format!("hello from writer {} ({})", i, msg_idx));
                             unsafe { reservation.publish_spin() };

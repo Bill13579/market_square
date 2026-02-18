@@ -145,7 +145,7 @@ fn main() {
         let (writer, mut reader) = init_area();
 
         // Write some messages
-        let mut reservation = writer.reserve(3).expect("Failed to reserve");
+        let mut reservation = writer.reserve::<()>(3).expect("Failed to reserve");
         reservation.get_mut(0).unwrap().write(100);
         reservation.get_mut(1).unwrap().write(200);
         reservation.get_mut(2).unwrap().write(300);
@@ -158,7 +158,7 @@ fn main() {
             println!("  [{}] = {}", i, val);
         }
         
-        let _ = slice.try_cleanup_old_slots();
+        let _ = slice.try_cleanup_old_slots::<()>();
         
         println!("done!");
     }

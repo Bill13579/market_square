@@ -49,6 +49,12 @@ pub enum ReserveError {
 pub enum PublishError {
     /// The range doesn't match the current read_gen (someone else published in between, or someone else with earlier generations have not yet published)
     CasFailed,
+    /// Publishing out of order (the start_generation of the range to be published didn't match the current read_gen)
+    /// 
+    /// Only occurs in Exclusive mode (when `E = Exclusive`), since in the CAS mode (when `E = ()`) the start range check is implicit in the CAS operation.
+    /// 
+    /// read_gen should be at start_generation when publishing with range [start_generation, end_generation), since otherwise readers might observe unpublished and uninitialized slots, leading to undefined behavior. If this assertion fails, some code is publishing out-of-order. Publishing must be strictly in the order of the generations returned by try_reserve_slots, in sequential order.
+    OutOfOrderPublishAttempt,
 }
 
 /// Errors that can occur when setting reader generation
@@ -226,6 +232,10 @@ impl<T> AreaInner<
     }
 }
 
+/// A marker type for specifying that CAS can be skipped for a writer operation because the caller is the only active writer.
+#[allow(dead_code)]
+pub struct Exclusive(u8);
+
 impl<T, SReaderGens, SBuf, SAtomicUsizeCounter> AreaInner<T, SReaderGens, SBuf, SAtomicUsizeCounter>
 where
     SReaderGens: FixedStorage<Slot<CachePadded<AtomicType>>> + FixedStorageMultiple<Slot<CachePadded<AtomicType>>>,
@@ -304,10 +314,10 @@ where
         self.writers_count.load(Ordering::Acquire)
     }
 
-    /// Try to reserve n slots for writing using CAS.
+    /// Try to reserve n slots for writing, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
     /// Returns (start_generation, end_generation) on success.
-    /// end_generation is exclusive (so the range is [start_generation, end_generation))
-    fn try_reserve_slots(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
+    /// end_generation is exclusive (so the range is [start_generation, end_generation)).
+    fn try_reserve_slots<E>(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
         debug_assert!(n != 0, "must reserve at least one slot");
 
         // Load current state
@@ -321,32 +331,41 @@ where
             return Err(ReserveError::NoSpace);
         }
 
-        // Try to CAS write_gen from current_write to current_write + n
-        let expected_new_write = gen_add_msb_masked(current_write, n as NumericType);
-        // Important Note: Here, it's theoretically possible now that we are wrapping that we somehow update write_gen to a value *equal* to free_gen.
-        // Usually without overflow, this isn't possible since free_gen is always behind write_gen while write_gen monotonically increases.
-        // However, if write_gen wraps, then it can become at least free_gen (it won't go beyond it on the first iteration since "available" is
-        // always at most enough on the first iteration to advance write_gen to exactly free_gen)
-        // If this happens though, the next time we try to reserve, we'll see free_gen == write_gen, and report every slot as available (because
-        // gen_dist_msb_masked(current_write, current_free) == 0), which is bad.
-        // However in practice for this to happen free_gen would have to be so behind in cleanup that the computer has probably already crashed already,
-        // since this requires 1 billion messages (for AtomicU32 for instance, 2^30 messages) to be left uncleaned on the buffer while writers keep trying to reserve
-        // more slots.
-        match self.write_gen.compare_exchange(
-            current_write,
-            expected_new_write,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok((current_write, expected_new_write)),
-            Err(_) => Err(ReserveError::FailedGrab),
+        if core::mem::size_of::<E>() == 0 { // CAS case
+            // Try to CAS write_gen from current_write to current_write + n
+            let expected_new_write = gen_add_msb_masked(current_write, n as NumericType);
+            // Important Note: Here, it's theoretically possible now that we are wrapping that we somehow update write_gen to a value *equal* to free_gen.
+            // Usually without overflow, this isn't possible since free_gen is always behind write_gen while write_gen monotonically increases.
+            // However, if write_gen wraps, then it can become at least free_gen (it won't go beyond it on the first iteration since "available" is
+            // always at most enough on the first iteration to advance write_gen to exactly free_gen)
+            // If this happens though, the next time we try to reserve, we'll see free_gen == write_gen, and report every slot as available (because
+            // gen_dist_msb_masked(current_write, current_free) == 0), which is bad.
+            // However in practice for this to happen free_gen would have to be so behind in cleanup that the computer has probably already crashed already,
+            // since this requires 1 billion messages (for AtomicU32 for instance, 2^30 messages) to be left uncleaned on the buffer while writers keep trying to reserve
+            // more slots.
+            match self.write_gen.compare_exchange(
+                current_write,
+                expected_new_write,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => Ok((current_write, expected_new_write)),
+                Err(_) => Err(ReserveError::FailedGrab),
+            }
+        } else {
+            // Update write_gen from current_write to current_write + n
+            let new_write_gen = gen_add_msb_masked(current_write, n as NumericType);
+            // See "Important Note" from try_reserve_slots above.
+            self.write_gen.store(new_write_gen, Ordering::Release);
+            
+            Ok((current_write, new_write_gen))
         }
     }
 
-    /// Try to reserve up to n slots, getting as many as possible, using CAS.
-    /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
-    /// Never returns `NoSpace`, since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
-    fn try_reserve_slots_best_effort(&self, n: usize) -> Result<(NumericType, NumericType, usize), ReserveError> {
+    /// Try to reserve up to n slots, getting as many as possible, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
+    /// Returns (start_generation, end_generation, actual_count) or [`ReserveError::FailedGrab`] on race (only when `E = ()`).
+    /// Never returns [`ReserveError::NoSpace`], since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
+    fn try_reserve_slots_best_effort<E>(&self, n: usize) -> Result<(NumericType, NumericType, usize), ReserveError> {
         if n == 0 {
             return Ok((0, 0, 0));
         }
@@ -362,76 +381,32 @@ where
             return Ok((0, 0, 0));
         }
 
-        // Try to CAS write_gen from current_write to current_write + actual
-        let expected_new_write = gen_add_msb_masked(current_write, actual_n);
-        // See "Important Note" from try_reserve_slots above.
-        match self.write_gen.compare_exchange(
-            current_write,
-            expected_new_write,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok((current_write, expected_new_write, actual_n as usize)),
-            Err(_) => Err(ReserveError::FailedGrab),
+        if core::mem::size_of::<E>() == 0 { // CAS case
+            // Try to CAS write_gen from current_write to current_write + actual
+            let expected_new_write = gen_add_msb_masked(current_write, actual_n);
+            // See "Important Note" from try_reserve_slots above.
+            match self.write_gen.compare_exchange(
+                current_write,
+                expected_new_write,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => Ok((current_write, expected_new_write, actual_n as usize)),
+                Err(_) => Err(ReserveError::FailedGrab),
+            }
+        } else {
+            // Update write_gen from current_write to current_write + actual
+            let new_write_gen = gen_add_msb_masked(current_write, actual_n);
+            // See "Important Note" from try_reserve_slots above.
+            self.write_gen.store(new_write_gen, Ordering::Release);
+
+            Ok((current_write, new_write_gen, actual_n as usize))
         }
     }
 
-    /// Try to reserve n slots for writing **assuming this writer is the only one ever writing!**
-    /// Returns (start_generation, end_generation) on success.
-    /// end_generation is exclusive (so the range is [start_generation, end_generation))
-    fn try_reserve_slots_ex(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
-        debug_assert!(n != 0, "must reserve at least one slot");
-
-        // Load current state
-        let current_free = self.load_free_gen();
-        let current_write = self.load_write_gen(); //NOTE: Must come AFTER loading current_free to be conservative about free spots being available.
-        debug_assert!(gen_lte_msb_masked(current_free, current_write), "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
-        let available = self.buffer_capacity as NumericType - (self.buffer_capacity as NumericType).min(gen_dist_msb_masked(current_write, current_free)); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
-
-        // Check if there's enough capacity
-        if (n as NumericType) > available {
-            return Err(ReserveError::NoSpace);
-        }
-
-        // Update write_gen from current_write to current_write + n
-        let new_write_gen = gen_add_msb_masked(current_write, n as NumericType);
-        // See "Important Note" from try_reserve_slots above.
-        self.write_gen.store(new_write_gen, Ordering::Release);
-        
-        Ok((current_write, new_write_gen))
-    }
-
-    /// Try to reserve up to n slots, getting as many as possible, **assuming this writer is the only one ever writing!**
-    /// Returns (start_generation, end_generation, actual_count).
-    /// Never returns an error, since the exclusivity assumption removes any `FailedGrab` scenarios and in the case that no slots are available it simply returns `(0, 0, 0)`.
-    fn try_reserve_slots_ex_best_effort(&self, n: usize) -> (NumericType, NumericType, usize) {
-        if n == 0 {
-            return (0, 0, 0);
-        }
-
-        // Load current state
-        let current_free = self.load_free_gen();
-        let current_write = self.load_write_gen(); //NOTE: Must come AFTER loading current_free to be conservative about free spots being available.
-        debug_assert!(gen_lte_msb_masked(current_free, current_write), "free_gen should never exceed write_gen! this should never happen. {} {} {}", current_free, current_write, self.load_read_gen());
-        let available = self.buffer_capacity as NumericType - (self.buffer_capacity as NumericType).min(gen_dist_msb_masked(current_write, current_free)); //NOTE: If current_write - current_free > buffer_capacity, that's because current_free hasn't caught up yet, since we never allow writers to lap readers by more than buffer_capacity. In that case, be conservative and report 0 available slots.
-        let actual_n = (n as NumericType).min(available);
-
-        if actual_n == 0 {
-            return (0, 0, 0);
-        }
-
-        // Update write_gen from current_write to current_write + actual
-        let new_write_gen = gen_add_msb_masked(current_write, actual_n);
-        // See "Important Note" from try_reserve_slots above.
-        self.write_gen.store(new_write_gen, Ordering::Release);
-        
-        (current_write, new_write_gen, actual_n as usize)
-    }
-
-    /// Publish slots in the range [start_generation, end_generation) for readers.
+    /// Publish slots in the range [start_generation, end_generation) for readers, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
     /// This must be called with exactly the range returned by try_reserve_slots.
-    /// Uses CAS to ensure no one else published in between.
-    fn publish_slots(
+    fn publish_slots<E>(
         &self,
         start_generation: NumericType,
         end_generation: NumericType,
@@ -440,15 +415,24 @@ where
             return Ok(());
         }
 
-        // CAS read_gen from start_generation to end_generation
-        match self.read_gen.compare_exchange(
-            start_generation,
-            end_generation,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(PublishError::CasFailed),
+        if core::mem::size_of::<E>() == 0 { // CAS case
+            // CAS read_gen from start_generation to end_generation
+            match self.read_gen.compare_exchange(
+                start_generation,
+                end_generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(PublishError::CasFailed),
+            }
+        } else {
+            if self.load_read_gen() != start_generation {
+                return Err(PublishError::OutOfOrderPublishAttempt);
+            }
+            // Update read_gen from start_generation to end_generation
+            self.read_gen.store(end_generation, Ordering::Release);
+            Ok(())
         }
     }
 
@@ -696,8 +680,8 @@ where
 
     /// Try to cleanup old slots by advancing last_valid_gen.
     /// This scans ALL reader generation slots (including empty ones), force-advances suspended readers,
-    /// and attempts to update last_valid_gen via CAS.
-    fn try_cleanup_old_slots(&self) -> Result<CleanupResult, CleanupError> {
+    /// and attempts to update last_valid_gen, using CAS if `E = ()`, or writing directly if `E = Exclusive`, assuming this thread is guaranteed to be the only one currently cleaning.
+    fn try_cleanup_old_slots<E>(&self) -> Result<CleanupResult, CleanupError> {
         let mut last_valid = self.load_last_valid_gen();
         let read_gen = self.load_read_gen();
 
@@ -769,14 +753,21 @@ where
                 return Err(CleanupError::NothingToClean);
             }
             // Since new_last_valid > last_valid/actual, there's more to clean, so try to do that.
-
-            // Try to CAS last_valid_gen:
-            match self.last_valid_gen.compare_exchange(
-                last_valid,
-                new_last_valid,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            
+            match if core::mem::size_of::<E>() == 0 { // CAS case
+                // Try to CAS last_valid_gen:
+                self.last_valid_gen.compare_exchange(
+                    last_valid,
+                    new_last_valid,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+            } else {
+                assert!(self.load_last_valid_gen() == last_valid, "last_valid_gen should not have changed while we were working if we are the only thread cleaning up.");
+                // Update last_valid_gen:
+                self.last_valid_gen.store(new_last_valid, Ordering::Release);
+                Ok(0)
+            } {
                 Ok(_) => {
                     // Successfully updated. Now we need to drop items in [last_valid, new_last_valid)
                     let slots_cleaned = gen_dist_msb_masked(new_last_valid, last_valid);
@@ -804,14 +795,21 @@ where
                             }
                         }
 
-                        match self.free_gen.compare_exchange(
-                            last_valid,
-                            new_last_valid,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => break,
-                            Err(_) => core::hint::spin_loop(), // Loop again to try updating free_gen since another cleanup thread is still working
+                        if core::mem::size_of::<E>() == 0 { // CAS case
+                            match self.free_gen.compare_exchange(
+                                last_valid,
+                                new_last_valid,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => break,
+                                Err(_) => core::hint::spin_loop(), // Loop again to try updating free_gen since another cleanup thread is still working
+                            }
+                        } else {
+                            assert!(self.load_free_gen() == last_valid, "free_gen should not have changed while we were working if we are the only thread cleaning up.");
+                            // Update free_gen:
+                            self.free_gen.store(new_last_valid, Ordering::Release);
+                            break;
                         }
                     }
 
@@ -895,35 +893,22 @@ where
 }
 
 pub trait AreaWriterTrait<T> {
-    /// Try to reserve n slots for writing.
+    /// Try to reserve n slots for writing, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
     /// Returns (start_generation, end_generation) on success.
     /// end_generation is exclusive (so the range is [start_generation, end_generation)).
-    fn try_reserve_slots(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError>;
+    fn try_reserve_slots<E>(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError>;
 
-    /// Try to reserve up to n slots, getting as many as possible.
-    /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
-    /// Never returns `NoSpace`, since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
-    /// end_generation is exclusive (so the range is [start_generation, end_generation)).
-    fn try_reserve_slots_best_effort(
+    /// Try to reserve up to n slots, getting as many as possible, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
+    /// Returns (start_generation, end_generation, actual_count) or [`ReserveError::FailedGrab`] on race (only when `E = ()`).
+    /// Never returns [`ReserveError::NoSpace`], since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
+    fn try_reserve_slots_best_effort<E>(
         &self,
         n: usize,
     ) -> Result<(NumericType, NumericType, usize), ReserveError>;
 
-    /// Try to reserve n slots for writing **assuming this writer is the only one ever writing!**
-    /// Returns (start_generation, end_generation) on success.
-    /// end_generation is exclusive (so the range is [start_generation, end_generation))
-    fn try_reserve_slots_ex(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError>;
-
-    /// Try to reserve up to n slots, getting as many as possible, **assuming this writer is the only one ever writing!**
-    /// Returns (start_generation, end_generation, actual_count).
-    /// Never returns an error, since the exclusivity assumption removes any `FailedGrab` scenarios and in the case that no slots are available it simply returns `(0, 0, 0)`.
-    fn try_reserve_slots_ex_best_effort(
-        &self,
-        n: usize,
-    ) -> (NumericType, NumericType, usize);
-
-    /// Publish slots in the range [start_generation, end_generation) for readers.
-    fn publish_slots(
+    /// Publish slots in the range [start_generation, end_generation) for readers, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
+    /// This must be called with exactly the range returned by try_reserve_slots.
+    fn publish_slots<E>(
         &self,
         start_generation: NumericType,
         end_generation: NumericType,
@@ -948,48 +933,29 @@ macro_rules! impl_writer_functionality {
                 SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
                 SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
             {
-                /// Try to reserve n slots for writing.
+                /// Try to reserve n slots for writing, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
                 /// Returns (start_generation, end_generation) on success.
                 /// end_generation is exclusive (so the range is [start_generation, end_generation)).
                 #[inline]
-                fn try_reserve_slots(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
-                    unsafe { self.inner.as_ref().try_reserve_slots(n) }
+                fn try_reserve_slots<E>(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
+                    unsafe { self.inner.as_ref().try_reserve_slots::<E>(n) }
                 }
 
-                /// Try to reserve up to n slots, getting as many as possible.
-                /// Returns (start_generation, end_generation, actual_count) or FailedGrab on race.
-                /// Never returns `NoSpace`, since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
-                /// end_generation is exclusive (so the range is [start_generation, end_generation)).
+                /// Try to reserve up to n slots, getting as many as possible, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
+                /// Returns (start_generation, end_generation, actual_count) or [`ReserveError::FailedGrab`] on race (only when `E = ()`).
+                /// Never returns [`ReserveError::NoSpace`], since in the case that no slots are available it simply returns `Ok((0, 0, 0))`.
                 #[inline]
-                fn try_reserve_slots_best_effort(
+                fn try_reserve_slots_best_effort<E>(
                     &self,
                     n: usize,
                 ) -> Result<(NumericType, NumericType, usize), ReserveError> {
-                    unsafe { self.inner.as_ref().try_reserve_slots_best_effort(n) }
+                    unsafe { self.inner.as_ref().try_reserve_slots_best_effort::<E>(n) }
                 }
 
-                /// Try to reserve n slots for writing **assuming this writer is the only one ever writing!**
-                /// Returns (start_generation, end_generation) on success.
-                /// end_generation is exclusive (so the range is [start_generation, end_generation))
+                /// Publish slots in the range [start_generation, end_generation) for readers, using CAS if `E = ()`, or writing directly assuming this writer is the only one active if `E = Exclusive`.
+                /// This must be called with exactly the range returned by try_reserve_slots.
                 #[inline]
-                fn try_reserve_slots_ex(&self, n: usize) -> Result<(NumericType, NumericType), ReserveError> {
-                    unsafe { self.inner.as_ref().try_reserve_slots_ex(n) }
-                }
-
-                /// Try to reserve up to n slots, getting as many as possible, **assuming this writer is the only one ever writing!**
-                /// Returns (start_generation, end_generation, actual_count).
-                /// Never returns an error, since the exclusivity assumption removes any `FailedGrab` scenarios and in the case that no slots are available it simply returns `(0, 0, 0)`.
-                #[inline]
-                fn try_reserve_slots_ex_best_effort(
-                    &self,
-                    n: usize,
-                ) -> (NumericType, NumericType, usize) {
-                    unsafe { self.inner.as_ref().try_reserve_slots_ex_best_effort(n) }
-                }
-
-                /// Publish slots in the range [start_generation, end_generation) for readers.
-                #[inline]
-                fn publish_slots(
+                fn publish_slots<E>(
                     &self,
                     start_generation: NumericType,
                     end_generation: NumericType,
@@ -997,7 +963,7 @@ macro_rules! impl_writer_functionality {
                     unsafe {
                         self.inner
                             .as_ref()
-                            .publish_slots(start_generation, end_generation)
+                            .publish_slots::<E>(start_generation, end_generation)
                     }
                 }
 
@@ -1022,8 +988,10 @@ macro_rules! impl_writer_functionality {
             {
                 /// Create a reservation for n slots.
                 /// Returns an RAII guard that must be published.
-                pub fn reserve(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
-                    let (start, end) = self.try_reserve_slots(n)?;
+                /// 
+                /// If this writer can be guaranteed to be the only active one at any moment, use `E = Exclusive` instead of `E = ()` to avoid the overhead of CAS. Consider if the performance benefits are necessary. If not, it might be safer to just use `E = ()` to allow for multiple concurrent writers anyways, though the single writer case *is* one of the best cases for this library.
+                pub fn reserve<E>(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
+                    let (start, end) = self.try_reserve_slots::<E>(n)?;
                     Ok(Reservation {
                         writer: self,
                         start_gen: start,
@@ -1035,42 +1003,12 @@ macro_rules! impl_writer_functionality {
 
                 /// Try to reserve up to n slots, getting as many as possible.
                 /// Returns an RAII guard that must be published.
-                pub fn reserve_best_effort(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
-                    let (start, end, count) = self.try_reserve_slots_best_effort(n)?;
-                    debug_assert!(gen_dist_msb_masked(end, start) == count as NumericType);
-                    Ok(Reservation {
-                        writer: self,
-                        start_gen: start,
-                        end_gen: end,
-                        published: false,
-                        phantom: PhantomData,
-                    })
-                }
-
-                /// Create a reservation for n slots **assuming this writer is the only one ever writing!**
-                /// Returns an RAII guard that must be published.
                 /// 
-                /// # Safety
-                /// Can never fail with `FailedGrab` since in the "exclusive" reservation functions we do not use CAS to reserve slots and so they always succeed. For safety however it can only be used if the caller can guarantee that no other writer is concurrently trying to reserve as well.
-                pub fn reserve_ex(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
-                    let (start, end) = self.try_reserve_slots_ex(n)?;
-                    Ok(Reservation {
-                        writer: self,
-                        start_gen: start,
-                        end_gen: end,
-                        published: false,
-                        phantom: PhantomData,
-                    })
-                }
-
-                /// Try to reserve up to n slots and getting as many as possible **assuming this writer is the only one ever writing!**
-                /// Returns an RAII guard that must be published.
-                /// If there are no slots available, this does not return `NoSpace` but instead simply returns an empty [`Reservation`].
+                /// If there are no slots available, this does not return [`ReserveError::NoSpace`] but instead simply returns an empty [`Reservation`].
                 /// 
-                /// # Safety
-                /// Can never fail, since in the "exclusive" reservation functions we do not use CAS to reserve slots and so they always succeed. For safety however it can only be used if the caller can guarantee that no other writer is concurrently trying to reserve as well.
-                pub fn reserve_ex_best_effort(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
-                    let (start, end, count) = self.try_reserve_slots_ex_best_effort(n);
+                /// If this writer can be guaranteed to be the only active one at any moment, use `E = Exclusive` instead of `E = ()` to avoid the overhead of CAS. Consider if the performance benefits are necessary. If not, it might be safer to just use `E = ()` to allow for multiple concurrent writers anyways, though the single writer case *is* one of the best cases for this library.
+                pub fn reserve_best_effort<E>(&self, n: usize) -> Result<Reservation<'_, Self, T>, ReserveError> {
+                    let (start, end, count) = self.try_reserve_slots_best_effort::<E>(n)?;
                     debug_assert!(gen_dist_msb_masked(end, start) == count as NumericType);
                     Ok(Reservation {
                         writer: self,
@@ -1107,10 +1045,12 @@ where
     SBuf: FixedStorage<UnsafeCell<MaybeUninit<T>>> + FixedStorageMultiple<UnsafeCell<MaybeUninit<T>>>,
     SAtomicUsizeCounter: FixedStorage<AtomicUsize>,
 {
-    /// Try to cleanup old slots by advancing last_valid_gen
+    /// Try to cleanup old slots by advancing last_valid_gen.
+    /// This scans ALL reader generation slots (including empty ones), force-advances suspended readers,
+    /// and attempts to update last_valid_gen, using CAS if `E = ()`, or writing directly if `E = Exclusive`, assuming this thread is guaranteed to be the only one currently cleaning.
     #[inline]
-    pub fn try_cleanup_old_slots(&self) -> Result<CleanupResult, CleanupError> {
-        unsafe { self.inner.as_ref().try_cleanup_old_slots() }
+    pub fn try_cleanup_old_slots<E>(&self) -> Result<CleanupResult, CleanupError> {
+        unsafe { self.inner.as_ref().try_cleanup_old_slots::<E>() }
     }
 }
 
@@ -1136,7 +1076,7 @@ where
                 // If we got destroy_stages to 0, we're responsible for cleanup
                 if prev_stages == 1 {
                     // Drop all remaining items in the buffer
-                    let _ = inner.try_cleanup_old_slots();
+                    let _ = inner.try_cleanup_old_slots::<Exclusive>(); // We can use the exclusive version here since we are the only thread left at this point. If we are free to drop the atomics, then we can definitely modify them without coordination as well.
 
                     // Free the leaked atomics
                     self.inner.as_ref().destroy_stages.deallocate();
@@ -1202,14 +1142,18 @@ where
     /// Publish the reserved slots.
     /// Consumes the reservation.
     /// 
+    /// If this writer can be guaranteed to be the only active one at any moment, use `E = Exclusive` instead of `E = ()` to avoid the overhead of CAS. Consider if the performance benefits are necessary. If not, it might be safer to just use `E = ()` to allow for multiple concurrent writers anyways, though the single writer case *is* one of the best cases for this library.
+    /// 
+    /// *Only fails when trying to publish out-of-order in the `E = Exclusive` case.*
+    /// 
     /// # Safety
     /// This function is marked unsafe since it is the point at which the messages go out, and readers can access it with the assumption that all slots are initialized.
     /// If you have not initialized all slots in the reservation before calling this, readers will see uninitialized data and cause undefined behavior.
-    pub unsafe fn publish(mut self) -> Result<(), Self> {
+    pub unsafe fn publish<E>(mut self) -> Result<(), (Self, PublishError)> {
         self.published = true;
-        match self.writer.publish_slots(self.start_gen, self.end_gen) {
+        match self.writer.publish_slots::<E>(self.start_gen, self.end_gen) {
             Ok(_) => Ok(()),
-            Err(PublishError::CasFailed) => Err(self),
+            Err(err) => Err((self, err)),
         }
     }
 
@@ -1224,7 +1168,7 @@ where
 
         #[cfg(debug_assertions)]
         let mut tr = 0;
-        while let Err(returned) = unsafe { reservation.publish() } {
+        while let Err((returned, err)) = unsafe { reservation.publish::<()>() } {
             #[cfg(debug_assertions)]
             {
                 tr += 1;
@@ -1235,6 +1179,11 @@ where
 
             reservation = returned;
             core::hint::spin_loop();
+
+            match err {
+                PublishError::CasFailed => continue, // Retry
+                PublishError::OutOfOrderPublishAttempt => unreachable!("OutOfOrderPublishAttempt should never happen in publish_spin since the range check is implicit in the CAS failure. There are no separate checks for this since there's no clear way to distinguish an out-of-order publish attempt from normal publishing failure due to correct coordination with other writers."),
+            }
         }
     }
 
@@ -1426,10 +1375,12 @@ where
         }
     }
 
-    /// Try to cleanup old slots by advancing last_valid_gen
+    /// Try to cleanup old slots by advancing last_valid_gen.
+    /// This scans ALL reader generation slots (including empty ones), force-advances suspended readers,
+    /// and attempts to update last_valid_gen, using CAS if `E = ()`, or writing directly if `E = Exclusive`, assuming this thread is guaranteed to be the only one currently cleaning.
     #[inline]
-    pub fn try_cleanup_old_slots(&self) -> Result<CleanupResult, CleanupError> {
-        unsafe { self.inner.as_ref().try_cleanup_old_slots() }
+    pub fn try_cleanup_old_slots<E>(&self) -> Result<CleanupResult, CleanupError> {
+        unsafe { self.inner.as_ref().try_cleanup_old_slots::<E>() }
     }
 }
 
@@ -1500,7 +1451,7 @@ where
                 // If we got destroy_stages to 0, we're responsible for final cleanup
                 if prev_stages == 1 {
                     // Drop all remaining items in the buffer
-                    let _ = inner.try_cleanup_old_slots();
+                    let _ = inner.try_cleanup_old_slots::<Exclusive>(); // We can use the exclusive version here since we are the only thread left at this point. If we are free to drop the atomics, then we can definitely modify them without coordination as well.
 
                     // Free the leaked atomics
                     self.inner.as_ref().destroy_stages.deallocate();
@@ -1646,10 +1597,12 @@ where
         }
     }
 
-    /// Try to cleanup old slots by advancing last_valid_gen
+    /// Try to cleanup old slots by advancing last_valid_gen.
+    /// This scans ALL reader generation slots (including empty ones), force-advances suspended readers,
+    /// and attempts to update last_valid_gen, using CAS if `E = ()`, or writing directly if `E = Exclusive`, assuming this thread is guaranteed to be the only one currently cleaning.
     #[inline]
-    pub fn try_cleanup_old_slots(&self) -> Result<CleanupResult, CleanupError> {
-        unsafe { self.reader.inner.as_ref().try_cleanup_old_slots() }
+    pub fn try_cleanup_old_slots<E>(&self) -> Result<CleanupResult, CleanupError> {
+        unsafe { self.reader.inner.as_ref().try_cleanup_old_slots::<E>() }
     }
 }
 
@@ -1895,7 +1848,7 @@ mod tests {
         // Initial state
         assert_eq!(reader.get_gen(), 0);
         // Reserve 4 slots
-        let (start, end) = writer.try_reserve_slots(4).expect("Failed to reserve");
+        let (start, end) = writer.try_reserve_slots::<()>(4).expect("Failed to reserve");
         assert_eq!(start, 0);
         assert_eq!(end, 4);
 
@@ -1908,7 +1861,7 @@ mod tests {
         }
 
         // Publish the slots
-        writer.publish_slots(start, end).expect("Failed to publish");
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
         // Verify read_gen moved forward
         unsafe {
@@ -1922,14 +1875,14 @@ mod tests {
         let (writer, _reader) = area::<u64>(16, 8);
 
         // Reserve 4 slots
-        let mut reservation = writer.reserve(4).unwrap();
+        let mut reservation = writer.reserve::<()>(4).unwrap();
         
         // Write to reservation
         for i in 0..4 {
             reservation.get_mut(i).unwrap().write(100 + i as u64);
         }
         
-        unsafe { reservation.publish() }.unwrap_or_else(|_| panic!("Failed to publish reservation"));
+        unsafe { reservation.publish::<()>() }.unwrap_or_else(|_| panic!("Failed to publish reservation"));
     }
 
     #[test]
@@ -1937,7 +1890,7 @@ mod tests {
         let (writer, _reader) = area::<u64>(16, 8);
 
         // Reserve 4 slots
-        let reservation = writer.reserve(4).unwrap();
+        let reservation = writer.reserve::<()>(4).unwrap();
         assert_eq!(reservation.len(), 4);
 
         // Split at 2
@@ -1953,11 +1906,11 @@ mod tests {
         right.get_mut(1).unwrap().write(103);
 
         // Verify correct ordering works.
-        match unsafe { right.publish() } {
+        match unsafe { right.publish::<()>() } {
             Ok(_) => panic!("Wrong order works; there's a bug"),
-            Err(right) => {
-                assert!(unsafe { left.publish() }.is_ok());
-                assert!(unsafe { right.publish() }.is_ok());
+            Err((right, _)) => {
+                assert!(unsafe { left.publish::<()>() }.is_ok());
+                assert!(unsafe { right.publish::<()>() }.is_ok());
             },
         }
     }
@@ -1967,7 +1920,7 @@ mod tests {
         let (writer, reader) = area::<u64>(16, 8);
 
         // Use reservation
-        let mut reservation = writer.reserve(4).expect("Failed to reserve");
+        let mut reservation = writer.reserve::<()>(4).expect("Failed to reserve");
         assert_eq!(reservation.len(), 4);
 
         // Write to slots
@@ -2002,7 +1955,7 @@ mod tests {
 
         let (writer, mut reader) = area::<ComplexStruct>(16, 8);
 
-        let mut reservation = writer.reserve(1).unwrap();
+        let mut reservation = writer.reserve::<()>(1).unwrap();
         let slot = reservation.get_mut(0).unwrap();
 
         // In-place initialization using raw pointers
@@ -2012,7 +1965,7 @@ mod tests {
             (&raw mut (*ptr).b).write(alloc::vec![1, 2, 3]);
         }
 
-        unsafe { reservation.publish() }.unwrap_or_else(|_| panic!("Failed to publish reservation"));
+        unsafe { reservation.publish::<()>() }.unwrap_or_else(|_| panic!("Failed to publish reservation"));
 
         // Verify read
         let slice = reader.read_with_check().expect("There should be writers!");
@@ -2026,7 +1979,7 @@ mod tests {
     #[should_panic(expected = "Reservation dropped without publishing")]
     fn test_reservation_panic_on_drop() {
         let (writer, _reader) = area::<u64>(16, 8);
-        let _reservation = writer.reserve(4).expect("Failed to reserve");
+        let _reservation = writer.reserve::<()>(4).expect("Failed to reserve");
         // Drop without publish -> panic
     }
 
@@ -2035,14 +1988,14 @@ mod tests {
         let (writer, reader) = area::<u64>(16, 8);
 
         // Write some messages
-        let (start, end) = writer.try_reserve_slots(3).expect("Failed to reserve");
+        let (start, end) = writer.try_reserve_slots::<()>(3).expect("Failed to reserve");
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
                 ptr.write(generation as u64 + 100);
             }
         }
-        writer.publish_slots(start, end).expect("Failed to publish");
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
         // Reader should be able to read
         let reader_gen = reader.get_gen();
@@ -2082,11 +2035,11 @@ mod tests {
         let writer2 = writer1.create_writer();
 
         // Both writers should work
-        let (start1, end1) = writer1.try_reserve_slots(2).expect("Failed to reserve");
+        let (start1, end1) = writer1.try_reserve_slots::<()>(2).expect("Failed to reserve");
         assert_eq!(start1, 0);
         assert_eq!(end1, 2);
 
-        let (start2, end2) = writer2.try_reserve_slots(2).expect("Failed to reserve");
+        let (start2, end2) = writer2.try_reserve_slots::<()>(2).expect("Failed to reserve");
         assert_eq!(start2, 2);
         assert_eq!(end2, 4);
     }
@@ -2101,14 +2054,14 @@ mod tests {
         assert_ne!(reader1.reader_id, reader2.reader_id);
 
         // Write some messages
-        let (start, end) = writer.try_reserve_slots(3).expect("Failed to reserve");
+        let (start, end) = writer.try_reserve_slots::<()>(3).expect("Failed to reserve");
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
                 ptr.write(generation as u64 * 2);
             }
         }
-        writer.publish_slots(start, end).expect("Failed to publish");
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
         // Both readers can read
         let read_gen = reader1.load_read_gen();
@@ -2121,12 +2074,12 @@ mod tests {
         let (writer, _reader) = area::<u64>(4, 8);
 
         // Fill the buffer
-        let (start1, end1) = writer.try_reserve_slots(4).expect("Failed to reserve");
+        let (start1, end1) = writer.try_reserve_slots::<()>(4).expect("Failed to reserve");
         assert_eq!(start1, 0);
         assert_eq!(end1, 4);
 
         // Try to reserve more - should fail
-        let result = writer.try_reserve_slots(1);
+        let result = writer.try_reserve_slots::<()>(1);
         assert_eq!(result, Err(ReserveError::NoSpace));
     }
 
@@ -2135,13 +2088,13 @@ mod tests {
         let (writer, _reader) = area::<u64>(4, 8);
 
         // Reserve 2 slots normally
-        let (start1, end1) = writer.try_reserve_slots(2).expect("Failed to reserve");
+        let (start1, end1) = writer.try_reserve_slots::<()>(2).expect("Failed to reserve");
         assert_eq!(start1, 0);
         assert_eq!(end1, 2);
 
         // Try to reserve 10 slots with best effort - should get only 2
         let (start2, end2, actual) = writer
-            .try_reserve_slots_best_effort(10)
+            .try_reserve_slots_best_effort::<()>(10)
             .expect("Failed to reserve");
         assert_eq!(start2, 2);
         assert_eq!(end2, 4);
@@ -2149,14 +2102,14 @@ mod tests {
 
         // Try to reserve again, should get 0
         let (start3, end3, actual2) = writer
-            .try_reserve_slots_best_effort(10)
+            .try_reserve_slots_best_effort::<()>(10)
             .expect("Failed to reserve");
         assert_eq!(start3, 0);
         assert_eq!(end3, 0);
         assert_eq!(actual2, 0);
 
         // Try to reserve more normally, should fail
-        assert_eq!(writer.try_reserve_slots(2), Err(ReserveError::NoSpace));
+        assert_eq!(writer.try_reserve_slots::<()>(2), Err(ReserveError::NoSpace));
     }
 
     #[test]
@@ -2199,20 +2152,20 @@ mod tests {
         let (writer, mut reader) = area::<u64>(16, 8);
 
         // Write some messages
-        let (start, end) = writer.try_reserve_slots(5).expect("Failed to reserve");
+        let (start, end) = writer.try_reserve_slots::<()>(5).expect("Failed to reserve");
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
                 ptr.write(generation as u64);
             }
         }
-        writer.publish_slots(start, end).expect("Failed to publish");
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
         // Reader advances past the messages
         reader.advance(5).expect("Failed to advance");
 
         // Cleanup should work now
-        let result = writer.try_cleanup_old_slots();
+        let result = writer.try_cleanup_old_slots::<()>();
         assert!(result.is_ok());
 
         let cleanup_result = result.unwrap();
@@ -2228,23 +2181,23 @@ mod tests {
         // Reader stays at 0
 
         // Fill the buffer
-        let (start, end) = writer.try_reserve_slots(4).expect("Failed to reserve");
-        writer.publish_slots(start, end).expect("Failed to publish");
+        let (start, end) = writer.try_reserve_slots::<()>(4).expect("Failed to reserve");
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
         // Writer should be blocked now
-        assert_eq!(writer.try_reserve_slots(1), Err(ReserveError::NoSpace));
+        assert_eq!(writer.try_reserve_slots::<()>(1), Err(ReserveError::NoSpace));
 
         // Unregister the reader (dropping it)
         drop(reader);
 
         // Trigger cleanup.
         let cleanup_result = writer
-            .try_cleanup_old_slots()
+            .try_cleanup_old_slots::<()>()
             .expect("Cleanup should succeed");
         assert_eq!(cleanup_result.new_last_valid, 4);
 
         // Now writer can write
-        let (start, end) = writer.try_reserve_slots(4).expect("Failed to reserve");
+        let (start, end) = writer.try_reserve_slots::<()>(4).expect("Failed to reserve");
         assert_eq!(start, 4);
         assert_eq!(end, 8);
     }
@@ -2306,7 +2259,7 @@ mod tests {
         let writer2 = writer1.create_writer();
 
         // Writer1 reserves slots 0-2
-        let (start1, end1) = writer1.try_reserve_slots(2).expect("Failed to reserve");
+        let (start1, end1) = writer1.try_reserve_slots::<()>(2).expect("Failed to reserve");
         unsafe {
             for generation in start1..end1 {
                 let ptr = writer1.get_slot_ptr(generation);
@@ -2315,7 +2268,7 @@ mod tests {
         }
 
         // Writer2 reserves slots 2-4
-        let (start2, end2) = writer2.try_reserve_slots(2).expect("Failed to reserve");
+        let (start2, end2) = writer2.try_reserve_slots::<()>(2).expect("Failed to reserve");
         unsafe {
             for generation in start2..end2 {
                 let ptr = writer2.get_slot_ptr(generation);
@@ -2324,21 +2277,21 @@ mod tests {
         }
 
         // If writer2 tries to publish first, it should fail
-        let result = writer2.publish_slots(start2, end2);
+        let result = writer2.publish_slots::<()>(start2, end2);
         assert_eq!(result, Err(PublishError::CasFailed));
 
         // Writer1 publishes successfully
         writer1
-            .publish_slots(start1, end1)
+            .publish_slots::<()>(start1, end1)
             .expect("Failed to publish");
 
         // Writer2 publishes successfully
         writer2
-            .publish_slots(start2, end2)
+            .publish_slots::<()>(start2, end2)
             .expect("Failed to publish");
 
         // Now if writer1 tries to publish again with stale range, it should fail
-        let result = writer1.publish_slots(start1, end1);
+        let result = writer1.publish_slots::<()>(start1, end1);
         assert_eq!(result, Err(PublishError::CasFailed));
     }
 
@@ -2352,14 +2305,14 @@ mod tests {
             let _reader2 = reader.create_reader_with_seed(100).expect("Failed to create reader");
 
             // Use the handles a bit
-            let (start, end) = writer.try_reserve_slots(2).expect("Failed to reserve");
+            let (start, end) = writer.try_reserve_slots::<()>(2).expect("Failed to reserve");
             unsafe {
                 for generation in start..end {
                     let ptr = writer.get_slot_ptr(generation);
                     ptr.write(generation as u64);
                 }
             }
-            writer.publish_slots(start, end).expect("Failed to publish");
+            writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
             // All handles will drop here
         }
@@ -2371,14 +2324,14 @@ mod tests {
         let (writer, mut reader) = area::<u64>(16, 8);
 
         // Write some messages
-        let (start, end) = writer.try_reserve_slots(5).expect("Failed to reserve");
+        let (start, end) = writer.try_reserve_slots::<()>(5).expect("Failed to reserve");
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
                 ptr.write(generation as u64 * 100);
             }
         }
-        writer.publish_slots(start, end).expect("Failed to publish");
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
         // Read using slice API
         {
@@ -2412,14 +2365,14 @@ mod tests {
         assert_eq!(reader_gen, 5);
 
         // New messages
-        let (start, end) = writer.try_reserve_slots(2).expect("Failed to reserve");
+        let (start, end) = writer.try_reserve_slots::<()>(2).expect("Failed to reserve");
         unsafe {
             for generation in start..end {
                 let ptr = writer.get_slot_ptr(generation);
                 ptr.write(generation as u64 * 10);
             }
         }
-        writer.publish_slots(start, end).expect("Failed to publish");
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
 
         // Read again
         {
@@ -2437,18 +2390,18 @@ mod tests {
         let (writer, mut reader1) = area::<u64>(16, 8);
 
         // Advance everything to generation 10
-        let (start, end) = writer.try_reserve_slots(10).unwrap();
+        let (start, end) = writer.try_reserve_slots::<()>(10).unwrap();
         unsafe {
             for i in start..end {
                 writer.get_slot_ptr(i).write(i as u64);
             }
         }
-        writer.publish_slots(start, end).unwrap();
+        writer.publish_slots::<()>(start, end).unwrap();
         reader1.advance(10).unwrap();
 
         // Cleanup should advance last_valid to 10
         // And it should drag all empty slots to 10
-        let result = writer.try_cleanup_old_slots().unwrap();
+        let result = writer.try_cleanup_old_slots::<()>().unwrap();
         assert_eq!(result.new_last_valid, 10);
 
         // Now register a new reader

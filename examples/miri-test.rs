@@ -7,6 +7,8 @@ use market_square::area::area;
 use market_square::arithmetics::NumericType;
 
 const N_WRITERS: usize = 5; //writers contend for a single atomic; more writers increase contention for that CAS operation
+type WriterIsExclusive = (); //more than one writer
+// type WriterIsExclusive = market_square::area::Exclusive; //only one writer
 const M_READERS: usize = 5; //market_square scales very well with readers
 //each reader and writer constitutes a thread; as with many lock-free algorithms, performance degrade if there are vastly more threads than CPU cores, especially with spin-waiting
 const MESSAGES_PER_WRITER: usize = 10_000;
@@ -49,7 +51,7 @@ fn benchmark_market_square() {
             let total_expected = (N_WRITERS * MESSAGES_PER_WRITER) as u64;
 
             while let Ok(slice) = reader.read_with_check() {
-                let _ = slice.try_cleanup_old_slots();
+                let _ = slice.try_cleanup_old_slots::<()>();
                 count += slice.len() as u64;
             }
 
@@ -73,7 +75,7 @@ fn benchmark_market_square() {
                 loop {
                     // Writers need to be careful not to begin cleanup before any readers can join. Here, we just don't clean up from the writer-side.
                     // let _ = writer.try_cleanup_old_slots();
-                    match writer.reserve(BATCH_SIZE) {
+                    match writer.reserve::<WriterIsExclusive>(BATCH_SIZE) {
                         Ok(mut reservation) => {
                             for i in 0..BATCH_SIZE {
                                 reservation.get_mut(i).unwrap().write((msg_idx * BATCH_SIZE + i) as u64); // Use msg_idx * BATCH_SIZE + i for unique values

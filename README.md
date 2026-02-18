@@ -32,6 +32,7 @@ The goal of this crate is high-performance broadcast, but not at the expense of 
 - `no_std` **and `no_alloc`** support
 - `small-gen` feature to use `AtomicU32`s instead of `AtomicU64`s internally, and overflow handling
 - `no-cache-pad` feature to turn off cache-padding (`align(4)`)
+- Even faster single-writer-multi-reader case by writing into atomics directly without CAS
 
 ## Usage
 
@@ -40,15 +41,15 @@ Add the following to your `Cargo.toml` file:
 ```toml
 # with std
 [dependencies]
-market_square = "0.2"
+market_square = "0.3"
 
 # with no_std
 [dependencies]
-market_square = { version = "0.2", default-features = false, features = ["alloc"] }
+market_square = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # with no_alloc (see examples/no-alloc-static.rs for an example using static memory)
 [dependencies]
-market_square = { version = "0.2", default-features = false }
+market_square = { version = "0.3", default-features = false }
 ```
 
 Usage is simple; you can create a new Area like so:

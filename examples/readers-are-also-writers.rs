@@ -30,7 +30,7 @@ fn main() {
             barrier.wait();
             loop {
                 if msg_idx < 8 {
-                    match area.reserve(1) {
+                    match area.reserve::<()>(1) {
                         Ok(mut reservation) => {
                             reservation.get_mut(0).unwrap().write(format!("hello from thread {} ({})", i, msg_idx));
                             unsafe { reservation.publish_spin() };
@@ -50,7 +50,7 @@ fn main() {
                 // 
                 // Also, when you are shouting in a market square, you always hear what you say yourself!
                 let slice = area.read();
-                let _ = slice.try_cleanup_old_slots();
+                let _ = slice.try_cleanup_old_slots::<()>();
                 if slice.len() != 0 {
                     println!(
                         "\n[thread {}] got {} messages! {:?}",

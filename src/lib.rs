@@ -32,6 +32,7 @@
 //! - `no_std` **and `no_alloc`** support
 //! - `small-gen` feature to use `AtomicU32`s instead of `AtomicU64`s internally, and overflow handling
 //! - `no-cache-pad` feature to turn off cache-padding (`align(4)`)
+//! - Even faster single-writer-multi-reader case by writing into atomics directly without CAS
 //! 
 //! ## Usage
 //! 
@@ -40,15 +41,15 @@
 //! ```toml
 //! # with std
 //! [dependencies]
-//! market_square = "0.2"
+//! market_square = "0.3"
 //! 
 //! # with no_std
 //! [dependencies]
-//! market_square = { version = "0.2", default-features = false, features = ["alloc"] }
+//! market_square = { version = "0.3", default-features = false, features = ["alloc"] }
 //! 
 //! # with no_alloc (see examples/no-alloc-static.rs for an example using static memory)
 //! [dependencies]
-//! market_square = { version = "0.2", default-features = false }
+//! market_square = { version = "0.3", default-features = false }
 //! ```
 //! 
 //! Usage is simple; you can create a new Area like so:
@@ -90,7 +91,7 @@
 //! 
 //!         reader_handles.push(thread::spawn(move || {
 //!             while let Ok(slice) = reader.read_with_check() {
-//!                 let _ = slice.try_cleanup_old_slots(); // Readers calling clean-up tends to work well.
+//!                 let _ = slice.try_cleanup_old_slots::<()>(); // Readers calling clean-up tends to work well.
 //!                 if slice.len() != 0 {
 //!                     println!(
 //!                         "\n[reader {}] got {} messages! {:?}",
@@ -113,7 +114,7 @@
 //!                     // Writers should be careful not to begin cleanup before any readers can join. Here, we just don't clean up from the writer-side.
 //!                     // let _ = writer.try_cleanup_old_slots();
 //! 
-//!                     match writer.reserve(1) {
+//!                     match writer.reserve::<()>(1) {
 //!                         Ok(mut reservation) => {
 //!                             reservation.get_mut(0).unwrap().write(format!("hello from writer {} ({})", i, msg_idx));
 //!                             unsafe { reservation.publish_spin(); }
@@ -174,7 +175,7 @@
 //!             barrier.wait();
 //!             loop {
 //!                 if msg_idx < 8 {
-//!                     match area.reserve(1) {
+//!                     match area.reserve::<()>(1) {
 //!                         Ok(mut reservation) => {
 //!                             reservation.get_mut(0).unwrap().write(format!("hello from thread {} ({})", i, msg_idx));
 //!                             unsafe { reservation.publish_spin(); }
@@ -194,7 +195,7 @@
 //!                 // 
 //!                 // Also, when you are shouting in a market square, you always hear what you say yourself!
 //!                 let slice = area.read();
-//!                 let _ = slice.try_cleanup_old_slots();
+//!                 let _ = slice.try_cleanup_old_slots::<()>();
 //!                 if slice.len() != 0 {
 //!                     println!(
 //!                         "\n[thread {}] got {} messages! {:?}",
