@@ -80,7 +80,14 @@ fn benchmark_market_square() {
                             for i in 0..BATCH_SIZE {
                                 reservation.get_mut(i).unwrap().write((msg_idx * BATCH_SIZE + i) as u64); // Use msg_idx * BATCH_SIZE + i for unique values
                             }
-                            unsafe { reservation.publish_spin() };
+                            if N_WRITERS == 1 {
+                                match unsafe { reservation.publish::<market_square::area::Exclusive>() } {
+                                    Ok(_) => (),
+                                    Err(_) => panic!("Failed to publish reservation! This should never happen with a single writer."),
+                                }
+                            } else {
+                                unsafe { reservation.publish_spin() };
+                            }
                             break;
                         }
                         Err(_) => {
