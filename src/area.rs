@@ -1659,6 +1659,26 @@ where
         }
     }
 
+    /// Get a slice of at most `n` currently available messages.
+    /// When the slice is dropped, the reader automatically advances past these messages.
+    ///
+    /// If fewer than `n` messages are available, returns all available messages.
+    pub fn read_at_most(&mut self, n: usize) -> ReadSlice<'_, T, Area, SReaderGens, SBuf, SAtomicUsizeCounter> {
+        let start_generation = gen_without_suspended_bit(self.get_gen());
+        let end_generation = self.load_read_gen();
+
+        let available = gen_dist_msb_masked(end_generation, start_generation) as usize;
+        let actual = available.min(n);
+        let capped_end = gen_add_msb_masked(start_generation, actual as NumericType);
+
+        ReadSlice {
+            reader: self,
+            start_gen: start_generation,
+            end_gen: capped_end,
+            armed: true,
+        }
+    }
+
     /// Get a slice of all currently available messages.
     /// When the slice is dropped, the reader automatically advances past these messages.
     /// 
@@ -2420,5 +2440,48 @@ mod tests {
     #[should_panic(expected = "reader_capacity must be a power of two")]
     fn test_area_creation_panics_on_invalid_capacity() {
         let (_writer, _reader) = area::<u64>(16, 0);
+    }
+
+    #[test]
+    fn test_read_at_most() {
+        let (writer, mut reader) = area::<u64>(16, 8);
+
+        // Write 10 messages
+        let (start, end) = writer.try_reserve_slots::<()>(10).expect("Failed to reserve");
+        unsafe {
+            for generation in start..end {
+                let ptr = writer.get_slot_ptr(generation);
+                ptr.write(generation as u64 * 10);
+            }
+        }
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
+
+        // Read at most 3
+        {
+            let slice = reader.read_at_most(3);
+            assert_eq!(slice.len(), 3);
+            assert_eq!(*slice.get(0).unwrap(), 0);
+            assert_eq!(*slice.get(1).unwrap(), 10);
+            assert_eq!(*slice.get(2).unwrap(), 20);
+            assert!(slice.get(3).is_none());
+        }
+
+        // Reader should have advanced by 3
+        assert_eq!(reader.get_gen(), 3);
+
+        // Read at most 100 (more than available)
+        {
+            let slice = reader.read_at_most(100);
+            assert_eq!(slice.len(), 7); // 10 - 3 = 7 remaining
+        }
+
+        assert_eq!(reader.get_gen(), 10);
+
+        // Read at most 5 when nothing available
+        {
+            let slice = reader.read_at_most(5);
+            assert_eq!(slice.len(), 0);
+            assert!(slice.is_empty());
+        }
     }
 }
