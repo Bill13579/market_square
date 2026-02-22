@@ -1521,6 +1521,16 @@ where
         self.armed = false;
     }
 
+    /// Re-arm this slice so it will once again auto-advance the reader on drop.
+    pub fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Returns whether this slice is armed (will automatically advance the reader on drop).
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
     /// Turns this slice into its components.
     ///
     /// # Safety
