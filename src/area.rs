@@ -997,6 +997,7 @@ macro_rules! impl_writer_functionality {
                         start_gen: start,
                         end_gen: end,
                         published: false,
+                        armed: true,
                         phantom: PhantomData,
                     })
                 }
@@ -1015,6 +1016,7 @@ macro_rules! impl_writer_functionality {
                         start_gen: start,
                         end_gen: end,
                         published: false,
+                        armed: true,
                         phantom: PhantomData,
                     })
                 }
@@ -1095,7 +1097,7 @@ where
 }
 
 /// A RAII guard for reserved slots.
-/// Must be published or dropped (which panics if not published).
+/// Must be published or dropped (which panics if not published, unless disarmed).
 #[derive(Debug)]
 pub struct Reservation<'a, W, T>
 where 
@@ -1105,6 +1107,7 @@ where
     pub(crate) start_gen: NumericType,
     pub(crate) end_gen: NumericType,
     pub(crate) published: bool,
+    pub(crate) armed: bool,
     phantom: PhantomData<T>,
 }
 
@@ -1120,6 +1123,29 @@ where
     /// Check if the reservation is empty
     pub fn is_empty(&self) -> bool {
         gen_gte_msb_masked(self.start_gen, self.end_gen)
+    }
+
+    /// Disarm this reservation so it won't panic on drop if unpublished.
+    /// The reserved slots remain valid and can still be filled (if not filled already) and published later.
+    /// 
+    /// This is useful when you want to hold multiple reservations and control publishing at your own pace.
+    /// 
+    /// # Safety
+    /// Disarmed, unpublished reservations permanently block the ring buffer 
+    /// from advancing past their generation range. Ensure all reservations 
+    /// are eventually published or that the area is being torn down.
+    pub unsafe fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Re-arm this reservation so it will panic on drop if unpublished.
+    pub fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Returns whether this reservation is armed (will panic on drop if unpublished).
+    pub fn is_armed(&self) -> bool {
+        self.armed
     }
 
     /// Get a mutable reference to the slot at the given index within the reservation.
@@ -1211,6 +1237,7 @@ where
             start_gen: self.start_gen,
             end_gen: split_gen,
             published: false,
+            armed: self.armed,
             phantom: PhantomData,
         };
 
@@ -1219,6 +1246,7 @@ where
             start_gen: split_gen,
             end_gen: self.end_gen,
             published: false,
+            armed: self.armed,
             phantom: PhantomData,
         };
 
@@ -1231,7 +1259,7 @@ where
     W: AreaWriterTrait<T>
 {
     fn drop(&mut self) {
-        if !self.published {
+        if !self.published && self.armed {
             // We can't easily "unreserve" slots in this design without breaking the ring buffer continuity
             // or introducing holes, so we must panic to alert the developer.
             panic!(
@@ -2493,5 +2521,68 @@ mod tests {
             assert_eq!(slice.len(), 0);
             assert!(slice.is_empty());
         }
+    }
+
+    #[test]
+    fn test_reservation_disarm_and_deferred_publish() {
+        let (writer, mut reader) = area::<u64>(16, 8);
+
+        // Reserve 10 slots
+        let reservation = writer.reserve::<()>(10).unwrap();
+        let start = reservation.start_gen;
+        let end = reservation.end_gen;
+
+        // Split into 5 chunks of 2
+        let (chunk0, rest) = reservation.split_at_mut(2);
+        let (chunk1, rest) = rest.split_at_mut(2);
+        let (chunk2, rest) = rest.split_at_mut(2);
+        let (chunk3, chunk4) = rest.split_at_mut(2);
+
+        // Disarm all chunks so we can hold them without panicking
+        let mut chunks = [chunk0, chunk1, chunk2, chunk3, chunk4];
+        for chunk in chunks.iter_mut() {
+            unsafe { chunk.disarm(); }
+        }
+
+        // Fill chunks, then drop them (disarmed, so no panic)
+        for (i, chunk) in chunks.iter_mut().enumerate() {
+            for j in 0..chunk.len() {
+                chunk.get_mut(j).unwrap().write((i * 2 + j) as u64 * 100);
+            }
+        }
+
+        // Drop all chunks. Since they're all disarmed this is fine
+        drop(chunks);
+
+        // Publish the entire range manually
+        writer.publish_slots::<()>(start, end).expect("Failed to publish");
+
+        // Verify all 10 messages are readable
+        let slice = reader.read_with_check().expect("There should be writers!");
+        assert_eq!(slice.len(), 10);
+        let values: Vec<u64> = slice.iter().copied().collect();
+        assert_eq!(values, alloc::vec![0, 100, 200, 300, 400, 500, 600, 700, 800, 900]);
+    }
+
+    #[test]
+    fn test_reservation_disarm_drop_no_panic() {
+        let (writer, _reader) = area::<u64>(16, 8);
+
+        let mut reservation = writer.reserve::<()>(4).expect("Failed to reserve");
+        unsafe { reservation.disarm(); }
+        // Dropping without publishing should NOT panic since we disarmed
+        drop(reservation);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reservation dropped without publishing")]
+    fn test_reservation_rearm_then_drop_panics() {
+        let (writer, _reader) = area::<u64>(16, 8);
+
+        let mut reservation = writer.reserve::<()>(4).expect("Failed to reserve");
+        unsafe { reservation.disarm(); }
+        reservation.arm(); // Re-arm it
+        // Dropping without publishing should panic again
+        drop(reservation);
     }
 }
