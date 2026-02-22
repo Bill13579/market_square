@@ -7,7 +7,7 @@ use core::{
 };
 
 #[cfg(debug_assertions)]
-const SPIN_LIMIT: usize = usize::MAX;
+pub(crate) const SPIN_LIMIT: usize = usize::MAX;
 
 use crate::{arithmetics::{AtomicType, MSB, NumericType, gen_add_msb_masked, gen_dist_msb_masked, gen_gt_msb_masked, gen_gte_msb_masked, gen_lt_msb_masked, gen_lte_msb_masked}, map::Slot, storage::{FixedStorage, FixedStorageMultiple}};
 
@@ -1101,10 +1101,10 @@ pub struct Reservation<'a, W, T>
 where 
     W: AreaWriterTrait<T>
 {
-    writer: &'a W,
-    start_gen: NumericType,
-    end_gen: NumericType,
-    published: bool,
+    pub(crate) writer: &'a W,
+    pub(crate) start_gen: NumericType,
+    pub(crate) end_gen: NumericType,
+    pub(crate) published: bool,
     phantom: PhantomData<T>,
 }
 
@@ -1153,7 +1153,10 @@ where
         self.published = true;
         match self.writer.publish_slots::<E>(self.start_gen, self.end_gen) {
             Ok(_) => Ok(()),
-            Err(err) => Err((self, err)),
+            Err(err) => {
+                self.published = false;
+                Err((self, err))
+            },
         }
     }
 
@@ -1181,8 +1184,10 @@ where
             core::hint::spin_loop();
 
             match err {
-                PublishError::CasFailed => continue, // Retry
-                PublishError::OutOfOrderPublishAttempt => unreachable!("OutOfOrderPublishAttempt should never happen in publish_spin since the range check is implicit in the CAS failure. There are no separate checks for this since there's no clear way to distinguish an out-of-order publish attempt from normal publishing failure due to correct coordination with other writers."),
+                PublishError::CasFailed => continue,
+                PublishError::OutOfOrderPublishAttempt => {
+                    unreachable!("OutOfOrderPublishAttempt should never happen in publish_spin since the range check is implicit in the CAS failure. There are no separate checks for this since there's no clear way to distinguish an out-of-order publish attempt from normal publishing failure due to correct coordination with other writers.")
+                },
             }
         }
     }
