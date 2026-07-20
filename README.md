@@ -1,4 +1,4 @@
-**Update 07/20/2026: Try [atomictrack](https://github.com/Bill13579/atomictrack) ([crates.io](https://crates.io/crates/atomictrack)) as well! It's a lower-level library that is the essence of market_square condensed into a more general form. You should be able to do the same thing as you could with market_square, but even more, including thread-waiting support.** It is however more a bit more involved, so both will continue to exist as separate options.
+**Update 07/20/2026: Try [atomictrack](https://github.com/Bill13579/atomictrack) ([crates.io](https://crates.io/crates/atomictrack)) as well! It's a lower-level library that is the essence of market_square condensed into a more general form. You should be able to do the same thing as you could with market_square, but even more, including thread-waiting support.** It is however a bit more involved, so both will continue to exist as separate options.
 
 [<img src="https://kooworks.org/xathek" alt="Xathek" width="280">](https://kooworks.org/xathek)
 
